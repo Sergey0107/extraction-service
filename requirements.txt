@@ -1,4 +1,4 @@
-﻿fastapi>=0.110
+fastapi>=0.110
 uvicorn[standard]>=0.27
-landingai-ade
+docling[vlm]
 httpx>=0.27

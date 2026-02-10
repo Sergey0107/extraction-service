@@ -1,16 +1,17 @@
-﻿import json
+import json
 import logging
 import os
 import time
 from contextlib import asynccontextmanager
-from typing import Optional, Union
+from importlib.metadata import PackageNotFoundError, version
+from typing import Any, Optional, Union
 from urllib.parse import urlparse
 
 from anyio import to_thread
+from docling.datamodel.base_models import InputFormat
+from docling.document_extractor import DocumentExtractor
 from fastapi import FastAPI, HTTPException
 from fastapi.encoders import jsonable_encoder
-import landingai_ade
-from landingai_ade import LandingAIADE
 from pydantic import BaseModel, Field
 
 logger = logging.getLogger("extraction_service")
@@ -24,14 +25,14 @@ def _get_env(name: str, default: Optional[str] = None) -> Optional[str]:
     return value
 
 
-PARSE_MODEL = _get_env("ADE_PARSE_MODEL", "dpt-2-latest")
-EXTRACT_MODEL = _get_env("ADE_EXTRACT_MODEL", "extract-latest")
-ADE_ENV = _get_env("ADE_ENV")
+DOC_PARSE_MODEL = _get_env("DOCLING_PARSE_MODEL", "docling")
+DOC_EXTRACT_MODEL = _get_env("DOCLING_EXTRACT_MODEL", "docling")
 DEBUG_ERRORS = _get_env("DEBUG_ERRORS", "0") == "1"
+ALLOWED_FORMATS = (InputFormat.IMAGE, InputFormat.PDF)
 
 
 class ExtractionRequest(BaseModel):
-    file_url: str = Field(..., description="S3 file URL")
+    file_url: str = Field(..., description="Public file URL")
     prompt: Optional[str] = None
     schema: Optional[Union[dict, str]] = None
     analysis_id: Optional[str] = None
@@ -41,30 +42,24 @@ class ExtractionRequest(BaseModel):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    api_key = _get_env("VISION_AGENT_API_KEY")
-    client_kwargs = {}
-    if api_key:
-        client_kwargs["apikey"] = api_key
-    if ADE_ENV:
-        client_kwargs["environment"] = ADE_ENV
-    client = LandingAIADE(**client_kwargs)
-    app.state.ade_client = client
-    if api_key:
-        logger.info("VISION_AGENT_API_KEY is set")
-    else:
-        logger.warning("VISION_AGENT_API_KEY is not set")
+    extractor = DocumentExtractor(allowed_formats=list(ALLOWED_FORMATS))
+    app.state.docling_extractor = extractor
+    logger.info(
+        "Docling extractor initialized with formats: %s",
+        [fmt.name for fmt in ALLOWED_FORMATS],
+    )
     try:
         yield
     finally:
-        close = getattr(client, "close", None)
+        close = getattr(extractor, "close", None)
         if callable(close):
             try:
                 close()
             except Exception:
-                logger.exception("Failed to close ADE client")
+                logger.exception("Failed to close Docling extractor")
 
 
-app = FastAPI(lifespan=lifespan, title="extraction-service", version="0.1.0")
+app = FastAPI(lifespan=lifespan, title="extraction-service", version="0.2.0")
 
 
 @app.get("/health")
@@ -72,30 +67,98 @@ async def health() -> dict:
     return {"status": "ok"}
 
 
-def _build_schema(prompt: Optional[str]) -> str:
-    schema = {
-        "type": "object",
-        "required": ["result"],
-        "properties": {
-            "result": {
-                "type": "string",
-                "description": prompt or "Extracted data",
+def _get_docling_version() -> Optional[str]:
+    try:
+        return version("docling")
+    except PackageNotFoundError:
+        return None
+
+
+def _build_default_template(prompt: Optional[str]) -> dict:
+    return {"result": "string"}
+
+
+def _is_json_schema(schema: dict) -> bool:
+    return schema.get("type") == "object" and isinstance(schema.get("properties"), dict)
+
+
+def _json_schema_to_template(schema: dict) -> dict:
+    properties = schema.get("properties", {})
+    template: dict[str, Any] = {}
+    for key, prop_schema in properties.items():
+        template[key] = _json_schema_value_to_template(prop_schema)
+    return template
+
+
+def _json_schema_value_to_template(schema: Any) -> Any:
+    if not isinstance(schema, dict):
+        return "string"
+
+    schema_type = schema.get("type")
+    if isinstance(schema_type, list):
+        schema_type = next(
+            (value for value in schema_type if value != "null"),
+            schema_type[0] if schema_type else None,
+        )
+
+    if schema_type == "object":
+        return _json_schema_to_template(schema)
+    if schema_type == "array":
+        items = schema.get("items", {})
+        return [_json_schema_value_to_template(items)]
+    if schema_type == "number":
+        return "float"
+    if schema_type == "integer":
+        return "integer"
+    if schema_type == "boolean":
+        return "boolean"
+    if schema_type == "string":
+        return "string"
+    if "enum" in schema:
+        return "string"
+    return "string"
+
+
+def _normalize_template(
+    schema: Optional[Union[dict, str]],
+    prompt: Optional[str],
+) -> Union[dict, str]:
+    if isinstance(schema, dict):
+        return _json_schema_to_template(schema) if _is_json_schema(schema) else schema
+    if isinstance(schema, str):
+        try:
+            parsed = json.loads(schema)
+        except json.JSONDecodeError:
+            return schema
+        if isinstance(parsed, dict):
+            return _json_schema_to_template(parsed) if _is_json_schema(parsed) else parsed
+        return schema
+    return _build_default_template(prompt)
+
+
+def _run_extraction(
+    extractor: DocumentExtractor,
+    file_url: str,
+    template: Union[dict, str],
+):
+    return extractor.extract(source=file_url, template=template)
+
+
+def _serialize_pages(result: Any) -> list[dict[str, Any]]:
+    pages = getattr(result, "pages", None)
+    if not pages:
+        return []
+    serialized = []
+    for page in pages:
+        serialized.append(
+            {
+                "page_no": getattr(page, "page_no", None),
+                "extracted_data": getattr(page, "extracted_data", None),
+                "raw_text": getattr(page, "raw_text", None),
+                "errors": getattr(page, "errors", None),
             }
-        },
-    }
-    return json.dumps(schema, ensure_ascii=True)
-
-
-def _run_extraction(client: LandingAIADE, file_url: str, schema_json: str):
-    parse_response = client.parse(
-        document_url=file_url,
-        model=PARSE_MODEL,
-    )
-    return client.extract(
-        schema=schema_json,
-        markdown=parse_response.markdown,
-        model=EXTRACT_MODEL,
-    )
+        )
+    return serialized
 
 
 @app.post("/extract")
@@ -107,46 +170,44 @@ async def extract_document(payload: ExtractionRequest) -> dict:
     if parsed_url.scheme not in {"http", "https", "ftp", "ftps"}:
         raise HTTPException(status_code=400, detail="file_url must be a public URL")
 
-    if isinstance(payload.schema, dict):
-        schema_json = json.dumps(payload.schema, ensure_ascii=True)
-    elif isinstance(payload.schema, str):
-        schema_json = payload.schema
-    else:
-        schema_json = _build_schema(payload.prompt)
+    template = _normalize_template(payload.schema, payload.prompt)
 
     started_at = time.monotonic()
     try:
-        extract_response = await to_thread.run_sync(
+        result = await to_thread.run_sync(
             _run_extraction,
-            app.state.ade_client,
+            app.state.docling_extractor,
             payload.file_url,
-            schema_json,
+            template,
         )
-    except landingai_ade.APIError as exc:
-        logger.exception("ADE API error")
-        status = getattr(exc, "status_code", None)
-        if status:
-            detail = f"ADE API error ({status}): {exc}"
-        else:
-            detail = f"ADE API error: {exc}"
-        raise HTTPException(status_code=502, detail=detail) from exc
     except Exception as exc:
-        logger.exception("Extraction failed")
-        detail = "Extraction failed"
+        logger.exception("Docling extraction failed")
+        detail = "Docling extraction failed"
         if DEBUG_ERRORS:
             detail = f"{detail}: {exc}"
-        raise HTTPException(status_code=500, detail=detail) from exc
+        raise HTTPException(status_code=502, detail=detail) from exc
     finally:
         elapsed = time.monotonic() - started_at
         logger.info("Extraction finished in %.2fs", elapsed)
+
+    pages = _serialize_pages(result)
+    page_errors = [
+        {"page_no": page.get("page_no"), "errors": page.get("errors")}
+        for page in pages
+        if page.get("errors")
+    ]
 
     response = {
         "analysis_id": payload.analysis_id,
         "file_id": payload.file_id,
         "file_type": payload.file_type,
-        "model_parse": PARSE_MODEL,
-        "model_extract": EXTRACT_MODEL,
-        "extraction": extract_response.extraction,
-        "extraction_metadata": extract_response.extraction_metadata,
+        "model_parse": DOC_PARSE_MODEL,
+        "model_extract": DOC_EXTRACT_MODEL,
+        "extraction": {"pages": pages},
+        "extraction_metadata": {
+            "docling_version": _get_docling_version(),
+            "page_count": len(pages),
+            "errors": page_errors,
+        },
     }
     return jsonable_encoder(response)
