@@ -5,6 +5,7 @@ import logging
 import mimetypes
 import os
 import re
+import subprocess
 import tempfile
 import time
 from contextlib import asynccontextmanager
@@ -1341,6 +1342,40 @@ def _convert_docx_to_structured_text(local_path: str) -> dict[str, Any]:
     }
 
 
+def _convert_office_document_to_pdf(local_path: str, output_dir: str) -> str:
+    source_path = Path(local_path)
+    target_dir = Path(output_dir)
+    target_dir.mkdir(parents=True, exist_ok=True)
+    profile_dir = target_dir / "lo-profile"
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    command = [
+        "soffice",
+        "--headless",
+        "--nologo",
+        "--nofirststartwizard",
+        "--nodefault",
+        f"-env:UserInstallation=file://{profile_dir.as_posix()}",
+        "--convert-to",
+        "pdf",
+        "--outdir",
+        str(target_dir),
+        str(source_path),
+    ]
+    result = subprocess.run(command, capture_output=True, text=True, timeout=90, check=False)
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "LibreOffice conversion failed").strip()
+        raise RuntimeError(detail)
+
+    expected_path = target_dir / f"{source_path.stem}.pdf"
+    if expected_path.exists():
+        return str(expected_path)
+
+    candidates = sorted(target_dir.glob("*.pdf"), key=lambda path: path.stat().st_mtime, reverse=True)
+    if not candidates:
+        raise RuntimeError("LibreOffice did not create a PDF preview")
+    return str(candidates[0])
+
+
 def _build_openrouter_messages_from_text(
     *,
     prompt: str,
@@ -1600,6 +1635,8 @@ async def _extract_via_llamaparse(payload: ExtractionRequest) -> dict[str, Any]:
     )
 
     downloaded_file = await _download_file(payload.file_url)
+    is_docx = _looks_like_docx(downloaded_file.filename, downloaded_file.content_type)
+    docx_pdf_temp_dir: tempfile.TemporaryDirectory | None = None
     started_at = time.monotonic()
     markdown_text = ""
     parse_metadata: dict[str, Any] = {
@@ -1620,6 +1657,8 @@ async def _extract_via_llamaparse(payload: ExtractionRequest) -> dict[str, Any]:
         "zero_based_normalized": False,
         "errors": [],
     }
+    geometry_local_path = downloaded_file.local_path
+    geometry_content_type = downloaded_file.content_type
     try:
         async with httpx.AsyncClient(
             timeout=httpx.Timeout(LLAMAPARSE_REQUEST_TIMEOUT_SECONDS),
@@ -1686,11 +1725,25 @@ async def _extract_via_llamaparse(payload: ExtractionRequest) -> dict[str, Any]:
                 candidate=extracted_data,
                 provider_name="OpenRouter schema repair (llamaparse)",
             )
+        if is_docx:
+            try:
+                docx_pdf_temp_dir = tempfile.TemporaryDirectory()
+                geometry_local_path = await to_thread.run_sync(
+                    lambda: _convert_office_document_to_pdf(
+                        downloaded_file.local_path,
+                        docx_pdf_temp_dir.name,
+                    )
+                )
+                geometry_content_type = "application/pdf"
+                parse_metadata["pdf_preview"] = {"created": True}
+            except Exception as exc:
+                logger.exception("DOCX PDF preview conversion failed")
+                parse_metadata["pdf_preview"] = {"created": False, "error": str(exc)}
         geometry_metadata = await to_thread.run_sync(
             lambda: _enrich_references_with_pdf_geometry(
                 extracted_data,
-                local_path=downloaded_file.local_path,
-                content_type=downloaded_file.content_type,
+                local_path=geometry_local_path,
+                content_type=geometry_content_type,
             )
         )
     except HTTPException:
@@ -1703,6 +1756,8 @@ async def _extract_via_llamaparse(payload: ExtractionRequest) -> dict[str, Any]:
         ) from exc
     finally:
         _cleanup_downloaded_file(downloaded_file)
+        if docx_pdf_temp_dir is not None:
+            docx_pdf_temp_dir.cleanup()
 
     elapsed = time.monotonic() - started_at
     logger.info("LlamaParse full pipeline finished in %.2fs", elapsed)
@@ -1754,6 +1809,7 @@ async def _extract_via_openrouter(payload: ExtractionRequest) -> dict[str, Any]:
     downloaded_file = await _download_file(payload.file_url)
     is_docx = _looks_like_docx(downloaded_file.filename, downloaded_file.content_type)
     docx_conversion_metadata: dict[str, Any] | None = None
+    docx_pdf_temp_dir: tempfile.TemporaryDirectory | None = None
     if is_docx:
         try:
             docx_conversion_metadata = await to_thread.run_sync(
@@ -1821,6 +1877,8 @@ async def _extract_via_openrouter(payload: ExtractionRequest) -> dict[str, Any]:
         "zero_based_normalized": False,
         "errors": [],
     }
+    geometry_local_path = downloaded_file.local_path
+    geometry_content_type = downloaded_file.content_type
     try:
         extracted_data, provider_response, used_fallback = await _chat_completion_json(
             endpoint=f"{OPENROUTER_BASE_URL.rstrip('/')}/chat/completions",
@@ -1839,11 +1897,30 @@ async def _extract_via_openrouter(payload: ExtractionRequest) -> dict[str, Any]:
                 candidate=extracted_data,
                 provider_name="OpenRouter schema repair",
             )
+        if is_docx:
+            try:
+                docx_pdf_temp_dir = tempfile.TemporaryDirectory()
+                geometry_local_path = await to_thread.run_sync(
+                    lambda: _convert_office_document_to_pdf(
+                        downloaded_file.local_path,
+                        docx_pdf_temp_dir.name,
+                    )
+                )
+                geometry_content_type = "application/pdf"
+                if docx_conversion_metadata is not None:
+                    docx_conversion_metadata["pdf_preview"] = {"created": True}
+            except Exception as exc:
+                logger.exception("DOCX PDF preview conversion failed")
+                if docx_conversion_metadata is not None:
+                    docx_conversion_metadata["pdf_preview"] = {
+                        "created": False,
+                        "error": str(exc),
+                    }
         geometry_metadata = await to_thread.run_sync(
             lambda: _enrich_references_with_pdf_geometry(
                 extracted_data,
-                local_path=downloaded_file.local_path,
-                content_type=downloaded_file.content_type,
+                local_path=geometry_local_path,
+                content_type=geometry_content_type,
             )
         )
     except HTTPException:
@@ -1856,6 +1933,8 @@ async def _extract_via_openrouter(payload: ExtractionRequest) -> dict[str, Any]:
         raise HTTPException(status_code=502, detail=detail) from exc
     finally:
         _cleanup_downloaded_file(downloaded_file)
+        if docx_pdf_temp_dir is not None:
+            docx_pdf_temp_dir.cleanup()
         elapsed = time.monotonic() - started_at
         logger.info("OpenRouter extraction finished in %.2fs", elapsed)
 
