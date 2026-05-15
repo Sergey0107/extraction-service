@@ -27,7 +27,7 @@ try:
     import fitz
 
     PYMUPDF_INSTALLED = True
-except ImportError:  # pragma: no cover - dependency may be omitted in some builds
+except ImportError:
     fitz = None
     PYMUPDF_INSTALLED = False
 
@@ -41,10 +41,10 @@ try:
 
     try:
         from docling.document_converter import ImageFormatOption
-    except ImportError:  # pragma: no cover - depends on docling version
+    except ImportError:
         ImageFormatOption = None
     DOCLING_INSTALLED = True
-except ImportError:  # pragma: no cover - docling is optional
+except ImportError:
     InputFormat = None
     VlmConvertOptions = Any
     VlmPipelineOptions = Any
@@ -810,13 +810,40 @@ def _search_token_candidate(page_index: PdfPageIndex, candidate: str) -> tuple[A
     return rect, best_coverage
 
 
+def _candidate_rank(candidate: dict[str, Any]) -> float:
+    return {
+        "quote_text": 1000.0,
+        "value": 950.0,
+        "label_plus_value": 850.0,
+        "raw_reference": 800.0,
+        "locator_text": 550.0,
+        "text": 520.0,
+        "anchor_text": 450.0,
+        "label": 250.0,
+    }.get(str(candidate.get("kind") or ""), 300.0)
+
+
+def _is_generic_table_anchor(candidate: dict[str, Any]) -> bool:
+    kind = str(candidate.get("kind") or "")
+    if kind not in {"anchor_text", "locator_text", "text"}:
+        return False
+    normalized = str(candidate.get("normalized") or _normalize_match_text(str(candidate.get("text") or "")))
+    return bool(re.fullmatch(r"(таблица|table)\s*\d*", normalized, flags=re.IGNORECASE))
+
+
 def _find_reference_location(
     pages: list[PdfPageIndex],
     candidates: list[dict[str, Any]],
 ) -> dict[str, Any] | None:
     best_match: dict[str, Any] | None = None
+    has_specific_candidate = any(
+        candidate.get("kind") in {"quote_text", "value", "label_plus_value", "raw_reference"}
+        for candidate in candidates
+    )
 
     for candidate in candidates:
+        if has_specific_candidate and _is_generic_table_anchor(candidate):
+            continue
         candidate_text = candidate["text"]
         candidate_weight = float(candidate.get("weight", 0.5))
         page_hint = _safe_page_number(candidate.get("page_hint"))
@@ -833,7 +860,11 @@ def _find_reference_location(
             if not rect:
                 continue
             page_bonus = 18.0 if page_hint and page_index.page_number == page_hint else 0.0
-            score = len(candidate.get("normalized", _normalize_match_text(candidate_text))) * candidate_weight + page_bonus
+            score = (
+                _candidate_rank(candidate)
+                + len(candidate.get("normalized", _normalize_match_text(candidate_text))) * candidate_weight
+                + page_bonus
+            )
             if not best_match or score > best_match["score"]:
                 best_match = {
                     "page": page_index.page_number,
@@ -847,6 +878,8 @@ def _find_reference_location(
         return best_match
 
     for candidate in candidates:
+        if has_specific_candidate and _is_generic_table_anchor(candidate):
+            continue
         candidate_text = candidate["text"]
         candidate_weight = float(candidate.get("weight", 0.5))
         page_hint = _safe_page_number(candidate.get("page_hint"))
@@ -863,7 +896,12 @@ def _find_reference_location(
             if not rect:
                 continue
             page_bonus = 12.0 if page_hint and page_index.page_number == page_hint else 0.0
-            score = coverage * 100 * candidate_weight + min(len(candidate_text), 120) / 10 + page_bonus
+            score = (
+                _candidate_rank(candidate)
+                + coverage * 100 * candidate_weight
+                + min(len(candidate_text), 120) / 10
+                + page_bonus
+            )
             if not best_match or score > best_match["score"]:
                 best_match = {
                     "page": page_index.page_number,
