@@ -8,6 +8,7 @@ import re
 import subprocess
 import tempfile
 import time
+import traceback
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version
@@ -423,6 +424,50 @@ def _extract_message_json_text(data: dict[str, Any], *, provider_name: str) -> s
     return content
 
 
+def _json_error_snippet(raw_content: str, position: int, radius: int = 700) -> str:
+    start = max(0, position - radius)
+    end = min(len(raw_content), position + radius)
+    prefix = "... " if start > 0 else ""
+    suffix = " ..." if end < len(raw_content) else ""
+    return prefix + raw_content[start:end] + suffix
+
+
+def _provider_response_metadata(data: dict[str, Any]) -> dict[str, Any]:
+    metadata: dict[str, Any] = {}
+    for key in ("id", "model", "provider"):
+        value = data.get(key)
+        if value is not None:
+            metadata[key] = value
+    choices = data.get("choices")
+    if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+        choice = choices[0]
+        for key in ("finish_reason", "native_finish_reason"):
+            value = choice.get(key)
+            if value is not None:
+                metadata[key] = value
+    usage = data.get("usage")
+    if isinstance(usage, dict):
+        metadata["usage"] = usage
+    return metadata
+
+
+def _json_decode_diagnostic(
+    provider_name: str,
+    raw_content: str,
+    exc: json.JSONDecodeError,
+    response_data: dict[str, Any],
+) -> str:
+    snippet = _json_error_snippet(raw_content, exc.pos)
+    metadata = _provider_response_metadata(response_data)
+    return (
+        f"{provider_name} returned invalid JSON: {exc.msg} "
+        f"at line={exc.lineno} column={exc.colno} char={exc.pos}; "
+        f"response_length={len(raw_content)}; "
+        f"response_metadata={json.dumps(metadata, ensure_ascii=True)}; "
+        f"snippet_around_error={json.dumps(snippet, ensure_ascii=True)}"
+    )
+
+
 def _parse_json_from_chat_response(data: dict[str, Any], *, provider_name: str) -> dict[str, Any]:
     content = _extract_message_json_text(data, provider_name=provider_name)
     parsed = json.loads(content)
@@ -461,6 +506,17 @@ def _raise_provider_http_error(response: httpx.Response, provider_name: str) -> 
     raise RuntimeError(
         f"{provider_name} HTTP {response.status_code}: {detail}"
     )
+
+
+def _json_schema_response_format(name: str, schema: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": name,
+            "strict": True,
+            "schema": schema,
+        },
+    }
 
 
 def _build_openrouter_provider_preferences(*, require_parameters: bool) -> dict[str, Any]:
@@ -1147,22 +1203,29 @@ async def _chat_completion_json(
     try:
         parsed = json.loads(raw_content)
     except json.JSONDecodeError as exc:
+        diagnostic = _json_decode_diagnostic(provider_name, raw_content, exc, data)
         if repair_schema and repair_model:
             logger.warning(
-                "%s returned invalid JSON, attempting repair: %s",
-                provider_name,
-                exc,
+                "%s; attempting repair",
+                diagnostic,
             )
-            parsed = await _repair_raw_text_to_schema(
-                endpoint=endpoint,
-                headers=headers,
-                model=repair_model,
-                schema=repair_schema,
-                raw_text=raw_content,
-                provider_name=f"{provider_name} raw JSON repair",
-            )
+            try:
+                parsed = await _repair_raw_text_to_schema(
+                    endpoint=endpoint,
+                    headers=headers,
+                    model=repair_model,
+                    schema=repair_schema,
+                    raw_text=raw_content,
+                    provider_name=f"{provider_name} raw JSON repair",
+                )
+            except Exception as repair_exc:
+                raise RuntimeError(
+                    f"{provider_name} returned invalid JSON and repair failed. "
+                    f"Original response diagnostic: {diagnostic}; "
+                    f"repair_error={repair_exc}"
+                ) from repair_exc
         else:
-            raise RuntimeError(f"{provider_name} returned invalid JSON: {exc}") from exc
+            raise RuntimeError(diagnostic) from exc
     if not isinstance(parsed, dict):
         raise RuntimeError(f"{provider_name} returned non-object JSON")
     return parsed, data, used_fallback
@@ -1205,6 +1268,7 @@ async def _repair_json_to_schema(
         "temperature": 0,
         "max_tokens": OPENROUTER_MAX_TOKENS,
         "stream": False,
+        "response_format": _json_schema_response_format("json_schema_repair", schema),
     }
     repaired, _, _ = await _chat_completion_json(
         endpoint=endpoint,
@@ -1239,6 +1303,7 @@ async def _repair_raw_text_to_schema(
         "temperature": 0,
         "max_tokens": OPENROUTER_MAX_TOKENS,
         "stream": False,
+        "response_format": _json_schema_response_format("raw_json_repair", schema),
     }
     repaired, _, _ = await _chat_completion_json(
         endpoint=endpoint,
@@ -1677,7 +1742,13 @@ async def _extract_via_llamaparse(payload: ExtractionRequest) -> dict[str, Any]:
         raise
     except Exception as exc:
         logger.exception("LlamaParse parsing failed")
-        raise HTTPException(status_code=502, detail=f"LlamaParse parsing failed: {exc}") from exc
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                f"LlamaParse parsing failed: {exc}\n\n"
+                f"Extraction service traceback:\n{traceback.format_exc()}"
+            ),
+        ) from exc
 
     messages = _build_openrouter_messages_from_text(
         prompt=prompt,
@@ -1690,14 +1761,7 @@ async def _extract_via_llamaparse(payload: ExtractionRequest) -> dict[str, Any]:
         "temperature": 0,
         "max_tokens": OPENROUTER_MAX_TOKENS,
         "stream": False,
-        "response_format": {
-            "type": "json_schema",
-            "json_schema": {
-                "name": "llamaparse_extraction",
-                "strict": True,
-                "schema": schema,
-            },
-        },
+        "response_format": _json_schema_response_format("llamaparse_extraction", schema),
     }
     provider_preferences = _build_openrouter_provider_preferences(require_parameters=True)
     if provider_preferences:
@@ -1752,7 +1816,10 @@ async def _extract_via_llamaparse(payload: ExtractionRequest) -> dict[str, Any]:
         logger.exception("OpenRouter structured extraction failed (llamaparse)")
         raise HTTPException(
             status_code=502,
-            detail=f"Structured extraction failed after LlamaParse: {exc}",
+            detail=(
+                f"Structured extraction failed after LlamaParse: {exc}\n\n"
+                f"Extraction service traceback:\n{traceback.format_exc()}"
+            ),
         ) from exc
     finally:
         _cleanup_downloaded_file(downloaded_file)
@@ -1819,7 +1886,10 @@ async def _extract_via_openrouter(payload: ExtractionRequest) -> dict[str, Any]:
             logger.exception("DOCX conversion failed")
             raise HTTPException(
                 status_code=502,
-                detail=f"DOCX conversion failed: {exc}",
+                detail=(
+                    f"DOCX conversion failed: {exc}\n\n"
+                    f"Extraction service traceback:\n{traceback.format_exc()}"
+                ),
             ) from exc
 
     messages = (
@@ -1840,14 +1910,7 @@ async def _extract_via_openrouter(payload: ExtractionRequest) -> dict[str, Any]:
         "temperature": 0,
         "max_tokens": OPENROUTER_MAX_TOKENS,
         "stream": False,
-        "response_format": {
-            "type": "json_schema",
-            "json_schema": {
-                "name": "openrouter_extraction",
-                "strict": True,
-                "schema": schema,
-            },
-        },
+        "response_format": _json_schema_response_format("openrouter_extraction", schema),
     }
     provider_preferences = _build_openrouter_provider_preferences(require_parameters=True)
     if provider_preferences:
@@ -1927,7 +1990,10 @@ async def _extract_via_openrouter(payload: ExtractionRequest) -> dict[str, Any]:
         raise
     except Exception as exc:
         logger.exception("OpenRouter extraction failed")
-        detail = f"OpenRouter extraction failed: {exc}"
+        detail = (
+            f"OpenRouter extraction failed: {exc}\n\n"
+            f"Extraction service traceback:\n{traceback.format_exc()}"
+        )
         if not DEBUG_ERRORS and detail:
             detail = str(detail)
         raise HTTPException(status_code=502, detail=detail) from exc
