@@ -606,6 +606,48 @@ def _reference_iter(node: Any):
             yield from _reference_iter(value)
 
 
+def _reference_iter_with_ancestors(node: Any, ancestors: tuple[dict[str, Any], ...] = ()):
+    if isinstance(node, dict):
+        references = node.get("references")
+        if isinstance(references, list):
+            yield node, references, ancestors
+        next_ancestors = (*ancestors, node)
+        for key, value in node.items():
+            if key == "references":
+                continue
+            yield from _reference_iter_with_ancestors(value, next_ancestors)
+    elif isinstance(node, list):
+        for value in node:
+            yield from _reference_iter_with_ancestors(value, ancestors)
+
+
+def _collect_ancestor_context(ancestors: tuple[dict[str, Any], ...]) -> list[str]:
+    context_values: list[str] = []
+    for node in reversed(ancestors):
+        product_name = node.get("product_name")
+        product_model = node.get("product_model")
+        if isinstance(product_name, str) and product_name.strip():
+            if isinstance(product_model, str) and product_model.strip():
+                context_values.append(f"{product_name.strip()} {product_model.strip()}")
+            context_values.append(product_name.strip())
+        if isinstance(product_model, str) and product_model.strip():
+            context_values.append(product_model.strip())
+        for key in ("title", "label", "name"):
+            value = node.get(key)
+            if isinstance(value, str) and value.strip():
+                context_values.append(value.strip())
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for value in context_values:
+        normalized = _normalize_match_text(value)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        deduped.append(value)
+    return deduped[:8]
+
+
 def _inject_synthetic_references(node: Any) -> int:
     injected = 0
     if isinstance(node, dict):
@@ -813,17 +855,55 @@ def _build_pdf_page_index(local_path: str) -> tuple[Any, list[PdfPageIndex]]:
     return document, pages
 
 
-def _search_exact_candidate(page: Any, candidate: str) -> Any | None:
+def _search_exact_candidate_rects(page: Any, candidate: str) -> list[Any]:
     snippet = candidate.strip()
     if len(snippet) < 3:
-        return None
+        return []
     if len(snippet) > 220:
         snippet = snippet[:220].rsplit(" ", 1)[0].strip() or snippet[:220]
     try:
         rects = page.search_for(snippet)
     except Exception:
-        return None
-    return _union_rects(rects) if rects else None
+        return []
+    return sorted(rects, key=lambda rect: (float(rect.y0), float(rect.x0))) if rects else []
+
+
+def _rect_center(rect: Any) -> tuple[float, float]:
+    return ((float(rect.x0) + float(rect.x1)) / 2, (float(rect.y0) + float(rect.y1)) / 2)
+
+
+def _select_best_exact_rect(
+    rects: list[Any],
+    page_index: PdfPageIndex,
+    context_terms: list[str],
+) -> tuple[Any | None, float]:
+    if not rects:
+        return None, 0.0
+    if len(rects) == 1:
+        return rects[0], 0.0
+
+    context_rects: list[Any] = []
+    for term in context_terms:
+        context_rects.extend(_search_exact_candidate_rects(page_index.page, term))
+        if context_rects:
+            break
+
+    if not context_rects:
+        return rects[0], 0.0
+
+    def distance_to_context(rect: Any) -> float:
+        rect_x, rect_y = _rect_center(rect)
+        best = float("inf")
+        for context_rect in context_rects:
+            context_x, context_y = _rect_center(context_rect)
+            vertical_distance = abs(rect_y - context_y)
+            horizontal_distance = abs(rect_x - context_x) * 0.15
+            best = min(best, vertical_distance + horizontal_distance)
+        return best
+
+    best_rect = min(rects, key=distance_to_context)
+    context_bonus = max(0.0, 80.0 - distance_to_context(best_rect))
+    return best_rect, context_bonus
 
 
 def _search_token_candidate(page_index: PdfPageIndex, candidate: str) -> tuple[Any | None, float]:
@@ -891,8 +971,10 @@ def _is_generic_table_anchor(candidate: dict[str, Any]) -> bool:
 def _find_reference_location(
     pages: list[PdfPageIndex],
     candidates: list[dict[str, Any]],
+    context_terms: list[str] | None = None,
 ) -> dict[str, Any] | None:
     best_match: dict[str, Any] | None = None
+    context_terms = context_terms or []
     has_specific_candidate = any(
         candidate.get("kind") in {"quote_text", "value", "label_plus_value", "raw_reference"}
         for candidate in candidates
@@ -913,7 +995,8 @@ def _find_reference_location(
             ),
         )
         for page_index in ordered_pages:
-            rect = _search_exact_candidate(page_index.page, candidate_text)
+            rects = _search_exact_candidate_rects(page_index.page, candidate_text)
+            rect, context_bonus = _select_best_exact_rect(rects, page_index, context_terms)
             if not rect:
                 continue
             page_bonus = 18.0 if page_hint and page_index.page_number == page_hint else 0.0
@@ -921,6 +1004,7 @@ def _find_reference_location(
                 _candidate_rank(candidate)
                 + len(candidate.get("normalized", _normalize_match_text(candidate_text))) * candidate_weight
                 + page_bonus
+                + context_bonus
             )
             if not best_match or score > best_match["score"]:
                 best_match = {
@@ -1043,9 +1127,10 @@ def _enrich_references_with_pdf_geometry(
         metadata["zero_based_normalized"] = _normalize_reference_pages(extracted_data)
         metadata["synthetic_reference_count"] = _inject_synthetic_references(extracted_data)
 
-        for holder, references in _reference_iter(extracted_data):
+        for holder, references, ancestors in _reference_iter_with_ancestors(extracted_data):
             label_context = _collect_label_context(holder)
             value_context = _collect_value_context(holder)
+            ancestor_context = _collect_ancestor_context(ancestors)
             for index, reference in enumerate(references):
                 metadata["reference_count"] += 1
                 original_reference = reference
@@ -1068,7 +1153,7 @@ def _enrich_references_with_pdf_geometry(
                 if not candidates:
                     continue
 
-                match = _find_reference_location(pages, candidates)
+                match = _find_reference_location(pages, candidates, ancestor_context)
                 if not match:
                     continue
 
