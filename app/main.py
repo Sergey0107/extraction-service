@@ -806,8 +806,8 @@ def _collect_reference_candidates(
     return deduped[:8]
 
 
-def _rect_to_bbox(rect: Any) -> dict[str, float]:
-    return {
+def _rect_to_bbox(rect: Any, page_rect: Any = None) -> dict[str, float]:
+    result: dict[str, float] = {
         "x": round(float(rect.x0), 3),
         "y": round(float(rect.y0), 3),
         "width": round(float(rect.x1 - rect.x0), 3),
@@ -821,6 +821,15 @@ def _rect_to_bbox(rect: Any) -> dict[str, float]:
         "right": round(float(rect.x1), 3),
         "bottom": round(float(rect.y1), 3),
     }
+    if page_rect is not None:
+        pw = float(page_rect.width)
+        ph = float(page_rect.height)
+        if pw > 0 and ph > 0:
+            result["norm_x0"] = round(min(1.0, max(0.0, float(rect.x0) / pw)), 6)
+            result["norm_y0"] = round(min(1.0, max(0.0, float(rect.y0) / ph)), 6)
+            result["norm_x1"] = round(min(1.0, max(0.0, float(rect.x1) / pw)), 6)
+            result["norm_y1"] = round(min(1.0, max(0.0, float(rect.y1) / ph)), 6)
+    return result
 
 
 def _union_rects(rects: list[Any]) -> Any | None:
@@ -854,6 +863,62 @@ def _build_pdf_page_index(local_path: str) -> tuple[Any, list[PdfPageIndex]]:
         pages.append(PdfPageIndex(page_number=page_index + 1, page=page, words=words))
     return document, pages
 
+
+
+
+def _build_pdf_page_index_ocr(local_path: str) -> tuple[Any, list[PdfPageIndex]]:
+    """
+    For scanned PDFs: renders each page as an image, runs Tesseract OCR,
+    and builds PdfPageIndex from the recognized words.
+    Word bboxes are in PDF-point coordinates (at DPI=150 scale).
+    """
+    import pytesseract
+    from PIL import Image
+    import io
+
+    DPI = 150
+    document = fitz.open(local_path)
+    pages: list[PdfPageIndex] = []
+
+    for page_index in range(document.page_count):
+        page = document.load_page(page_index)
+        mat = fitz.Matrix(DPI / 72, DPI / 72)
+        pix = page.get_pixmap(matrix=mat, alpha=False)
+        img_bytes = pix.tobytes("png")
+        img = Image.open(io.BytesIO(img_bytes))
+
+        try:
+            ocr_data = pytesseract.image_to_data(
+                img,
+                lang="rus+eng",
+                output_type=pytesseract.Output.DICT,
+            )
+        except Exception as exc:
+            logger.warning("OCR failed for page %d: %s", page_index + 1, exc)
+            pages.append(PdfPageIndex(page_number=page_index + 1, page=page, words=[]))
+            continue
+
+        scale = 72.0 / DPI  # pixels -> PDF points
+        words: list[PdfWord] = []
+        n = len(ocr_data["text"])
+        for i in range(n):
+            text = str(ocr_data["text"][i]).strip()
+            conf = int(ocr_data["conf"][i])
+            if not text or conf < 30:
+                continue
+            normalized = _normalize_match_text(text)
+            if not normalized:
+                continue
+            x = ocr_data["left"][i] * scale
+            y = ocr_data["top"][i] * scale
+            w = ocr_data["width"][i] * scale
+            h = ocr_data["height"][i] * scale
+            rect = fitz.Rect(x, y, x + w, y + h)
+            words.append(PdfWord(text=text, normalized=normalized, rect=rect))
+
+        pages.append(PdfPageIndex(page_number=page_index + 1, page=page, words=words))
+
+    return document, pages
 
 def _search_exact_candidate_rects(page: Any, candidate: str) -> list[Any]:
     snippet = candidate.strip()
@@ -947,8 +1012,115 @@ def _search_token_candidate(page_index: PdfPageIndex, candidate: str) -> tuple[A
     return rect, best_coverage
 
 
-def _candidate_rank(candidate: dict[str, Any]) -> float:
-    return {
+
+
+def _token_overlap_ratio(a: str, b: str) -> float:
+    """Fraction of tokens from a that are found in b."""
+    tokens_a = set(_tokenize_match_text(a))
+    tokens_b = set(_tokenize_match_text(b))
+    if not tokens_a:
+        return 0.0
+    return len(tokens_a & tokens_b) / len(tokens_a)
+
+
+def _search_table_row_candidate(
+    page_index: PdfPageIndex,
+    anchor_text: str,
+) -> tuple[Any | None, float]:
+    """
+    Searches for the table row or text line containing anchor_text.
+    Strategy:
+      1. Use page.find_tables() — if anchor_text matches a cell, return bbox of the whole row.
+      2. Otherwise find the text line whose words best overlap anchor tokens (Y-band grouping).
+    """
+    normalized_anchor = _normalize_match_text(anchor_text)
+    if not normalized_anchor or len(normalized_anchor) < 2:
+        return None, 0.0
+
+    # --- Step 1: Search in tables ---
+    try:
+        tables = page_index.page.find_tables()
+        for table in tables.tables:
+            for row in table.rows:
+                for cell in row.cells:
+                    if cell is None:
+                        continue
+                    try:
+                        cell_rect = fitz.Rect(cell) if not isinstance(cell, fitz.Rect) else cell
+                    except Exception:
+                        continue
+                    cell_text = page_index.page.get_textbox(cell_rect).strip()
+                    cell_normalized = _normalize_match_text(cell_text)
+                    if not cell_normalized:
+                        continue
+                    if (
+                        normalized_anchor in cell_normalized
+                        or cell_normalized in normalized_anchor
+                        or _token_overlap_ratio(normalized_anchor, cell_normalized) >= 0.6
+                    ):
+                        row_rect = _union_rects([
+                            fitz.Rect(c) if not isinstance(c, fitz.Rect) else c
+                            for c in row.cells
+                            if c is not None
+                        ])
+                        if row_rect and not row_rect.is_empty:
+                            overlap = _token_overlap_ratio(normalized_anchor, cell_normalized)
+                            return row_rect, max(0.7, overlap)
+    except Exception as exc:
+        logger.debug("find_tables failed on page %d: %s", page_index.page_number, exc)
+
+    # --- Step 2: Free-text Y-band search ---
+    if not page_index.words:
+        return None, 0.0
+
+    line_tolerance = 4.0  # words within this y0 delta are on the same line
+    lines: list[list[PdfWord]] = []
+    current_line: list[PdfWord] = []
+    current_y = None
+    for word in page_index.words:
+        word_y = float(word.rect.y0)
+        if current_y is None or abs(word_y - current_y) <= line_tolerance:
+            current_line.append(word)
+            if current_y is None:
+                current_y = word_y
+        else:
+            if current_line:
+                lines.append(current_line)
+            current_line = [word]
+            current_y = word_y
+    if current_line:
+        lines.append(current_line)
+
+    anchor_tokens = set(_tokenize_match_text(anchor_text))
+    if not anchor_tokens:
+        return None, 0.0
+
+    best_line = None
+    best_overlap = 0.0
+    for line in lines:
+        line_tokens = set(w.normalized for w in line)
+        overlap = len(anchor_tokens & line_tokens) / len(anchor_tokens)
+        if overlap > best_overlap:
+            best_overlap = overlap
+            best_line = line
+
+    if best_line and best_overlap >= 0.5:
+        rect = _union_rects([w.rect for w in best_line])
+        return rect, best_overlap
+
+    return None, 0.0
+
+def _is_ambiguous_short_candidate(text: str, normalized: str) -> bool:
+    """Returns True if candidate is short or purely numeric/units."""
+    if len(normalized) <= 6:
+        return True
+    if re.fullmatch(r"[\d.,\-+/%\s]+", text.strip()):
+        return True
+    return False
+
+
+def _candidate_rank(candidate: dict[str, Any], has_descriptive_candidate: bool = False) -> float:
+    base = {
         "quote_text": 1000.0,
         "value": 950.0,
         "label_plus_value": 850.0,
@@ -958,6 +1130,14 @@ def _candidate_rank(candidate: dict[str, Any]) -> float:
         "anchor_text": 450.0,
         "label": 250.0,
     }.get(str(candidate.get("kind") or ""), 300.0)
+
+    # Lower rank for short/numeric quote_text or value when a descriptive candidate exists.
+    if has_descriptive_candidate and candidate.get("kind") in {"quote_text", "value"}:
+        text = str(candidate.get("text") or "")
+        normalized = str(candidate.get("normalized") or _normalize_match_text(text))
+        if _is_ambiguous_short_candidate(text, normalized):
+            return 200.0
+    return base
 
 
 def _is_generic_table_anchor(candidate: dict[str, Any]) -> bool:
@@ -978,6 +1158,12 @@ def _find_reference_location(
     has_specific_candidate = any(
         candidate.get("kind") in {"quote_text", "value", "label_plus_value", "raw_reference"}
         for candidate in candidates
+    )
+    # Whether a descriptive (long) candidate exists — used to penalise short/numeric ones
+    has_descriptive_candidate = any(
+        c.get("kind") in {"anchor_text", "locator_text", "label_plus_value"}
+        and len(str(c.get("normalized") or _normalize_match_text(str(c.get("text") or "")))) > 6
+        for c in candidates
     )
 
     for candidate in candidates:
@@ -1001,7 +1187,7 @@ def _find_reference_location(
                 continue
             page_bonus = 18.0 if page_hint and page_index.page_number == page_hint else 0.0
             score = (
-                _candidate_rank(candidate)
+                _candidate_rank(candidate, has_descriptive_candidate=has_descriptive_candidate)
                 + len(candidate.get("normalized", _normalize_match_text(candidate_text))) * candidate_weight
                 + page_bonus
                 + context_bonus
@@ -1009,7 +1195,7 @@ def _find_reference_location(
             if not best_match or score > best_match["score"]:
                 best_match = {
                     "page": page_index.page_number,
-                    "bbox": _rect_to_bbox(rect),
+                    "bbox": _rect_to_bbox(rect, page_index.page.rect),
                     "score": score,
                     "locator_strategy": "pymupdf_exact",
                     "matched_text": candidate_text,
@@ -1038,7 +1224,7 @@ def _find_reference_location(
                 continue
             page_bonus = 12.0 if page_hint and page_index.page_number == page_hint else 0.0
             score = (
-                _candidate_rank(candidate)
+                _candidate_rank(candidate, has_descriptive_candidate=has_descriptive_candidate)
                 + coverage * 100 * candidate_weight
                 + min(len(candidate_text), 120) / 10
                 + page_bonus
@@ -1046,11 +1232,51 @@ def _find_reference_location(
             if not best_match or score > best_match["score"]:
                 best_match = {
                     "page": page_index.page_number,
-                    "bbox": _rect_to_bbox(rect),
+                    "bbox": _rect_to_bbox(rect, page_index.page.rect),
                     "score": score,
                     "locator_strategy": "pymupdf_tokens",
                     "matched_text": candidate_text,
                 }
+    # --- Third pass: table row / free-text line search ---
+    anchor_candidates = [
+        c for c in candidates
+        if c.get("kind") in {"anchor_text", "locator_text", "label", "label_plus_value"}
+        and len(c.get("normalized", "")) >= 3
+    ]
+    for candidate in anchor_candidates:
+        if has_specific_candidate and _is_generic_table_anchor(candidate):
+            continue
+        candidate_text = candidate["text"]
+        candidate_weight = float(candidate.get("weight", 0.5))
+        page_hint = _safe_page_number(candidate.get("page_hint"))
+        ordered_pages = sorted(
+            pages,
+            key=lambda page_index: (
+                0 if page_hint and page_index.page_number == page_hint else 1,
+                abs(page_index.page_number - page_hint) if page_hint else 0,
+                page_index.page_number,
+            ),
+        )
+        for page_index in ordered_pages:
+            rect, overlap = _search_table_row_candidate(page_index, candidate_text)
+            if not rect:
+                continue
+            page_bonus = 10.0 if page_hint and page_index.page_number == page_hint else 0.0
+            score = (
+                _candidate_rank(candidate, has_descriptive_candidate=False)
+                + overlap * 80 * candidate_weight
+                + min(len(candidate_text), 120) / 10
+                + page_bonus
+            )
+            if not best_match or score > best_match["score"]:
+                best_match = {
+                    "page": page_index.page_number,
+                    "bbox": _rect_to_bbox(rect, page_index.page.rect),
+                    "score": score,
+                    "locator_strategy": "table_row",
+                    "matched_text": candidate_text,
+                }
+
     return best_match
 
 
@@ -1097,6 +1323,7 @@ def _enrich_references_with_pdf_geometry(
         "provider": "pymupdf" if PYMUPDF_INSTALLED else None,
         "applied": False,
         "searchable_pdf": False,
+        "ocr_applied": False,
         "page_count": 1,
         "reference_count": 0,
         "matched_reference_count": 0,
@@ -1121,8 +1348,33 @@ def _enrich_references_with_pdf_geometry(
         metadata["page_count"] = document.page_count
         metadata["searchable_pdf"] = any(page.words for page in pages)
         if not metadata["searchable_pdf"]:
-            metadata["errors"].append("PDF has no searchable text layer")
-            return metadata
+            # Attempt OCR fallback for scanned PDFs
+            ocr_available = False
+            try:
+                import pytesseract
+                pytesseract.get_tesseract_version()
+                ocr_available = True
+            except Exception:
+                pass
+
+            if not ocr_available:
+                metadata["errors"].append("PDF has no searchable text layer and tesseract is not available")
+                return metadata
+
+            try:
+                if document is not None:
+                    document.close()
+                document, pages = _build_pdf_page_index_ocr(local_path)
+                metadata["searchable_pdf"] = any(page.words for page in pages)
+                metadata["ocr_applied"] = True
+            except Exception as exc:
+                logger.warning("OCR fallback failed: %s", exc)
+                metadata["errors"].append(f"OCR failed: {exc}")
+                return metadata
+
+            if not metadata["searchable_pdf"]:
+                metadata["errors"].append("OCR produced no words")
+                return metadata
 
         metadata["zero_based_normalized"] = _normalize_reference_pages(extracted_data)
         metadata["synthetic_reference_count"] = _inject_synthetic_references(extracted_data)

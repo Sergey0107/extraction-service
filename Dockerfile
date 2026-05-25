@@ -11,6 +11,9 @@ RUN apt-get update \
         libreoffice-writer \
         fonts-dejavu \
         fonts-liberation \
+        tesseract-ocr \
+        tesseract-ocr-rus \
+        tesseract-ocr-eng \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt /app/
