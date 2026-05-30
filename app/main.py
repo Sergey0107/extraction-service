@@ -22,6 +22,7 @@ from docx import Document as WordDocument
 from docx.table import Table as WordTable
 from docx.text.paragraph import Paragraph as WordParagraph
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import Response
 from fastapi.encoders import jsonable_encoder
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -111,7 +112,7 @@ OPENROUTER_API_KEY = _get_env("OPENROUTER_API_KEY")
 OPENROUTER_MODEL = _get_env("OPENROUTER_MODEL", "openai/gpt-4o-mini")
 OPENROUTER_BASE_URL = _get_env("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
 OPENROUTER_PDF_ENGINE = _get_env("OPENROUTER_PDF_ENGINE", "mistral-ocr")
-OPENROUTER_MAX_TOKENS = _get_int_env("OPENROUTER_MAX_TOKENS", 4000)
+OPENROUTER_MAX_TOKENS = min(_get_int_env("OPENROUTER_MAX_TOKENS", 4000), 8000)
 OPENROUTER_APP_NAME = _get_env("OPENROUTER_APP_NAME", "extraction-service")
 OPENROUTER_SITE_URL = _get_env("OPENROUTER_SITE_URL", "http://localhost:8005")
 OPENROUTER_PROVIDER_ORDER = _get_list_env("OPENROUTER_PROVIDER_ORDER")
@@ -665,6 +666,23 @@ def _safe_page_number(value: Any) -> int | None:
     if isinstance(value, str) and value.strip().isdigit():
         return int(value.strip())
     return None
+
+
+def _normalize_references_in_place(node: Any) -> None:
+    """Нормализует поле references везде в дереве:
+    если модель вернула dict вместо list — оборачивает в list.
+    Некоторые модели (gpt-4o-mini) возвращают один объект вместо массива.
+    """
+    if isinstance(node, dict):
+        references = node.get("references")
+        if isinstance(references, dict):
+            node["references"] = [references]
+        for key, value in node.items():
+            if key != "references":
+                _normalize_references_in_place(value)
+    elif isinstance(node, list):
+        for value in node:
+            _normalize_references_in_place(value)
 
 
 def _reference_iter(node: Any):
@@ -2410,6 +2428,8 @@ async def _extract_via_openrouter(payload: ExtractionRequest) -> dict[str, Any]:
                 candidate=extracted_data,
                 provider_name="OpenRouter schema repair",
             )
+        # Нормализуем references: некоторые модели возвращают dict вместо list
+        _normalize_references_in_place(extracted_data)
         if is_docx:
             try:
                 docx_pdf_temp_dir = tempfile.TemporaryDirectory()
@@ -2475,6 +2495,57 @@ async def _extract_via_openrouter(payload: ExtractionRequest) -> dict[str, Any]:
         },
     }
     return jsonable_encoder(response)
+
+
+@app.get("/render-pdf")
+async def render_pdf(url: str) -> Response:
+    """Скачивает PDF по URL, рендерит каждую страницу через PyMuPDF в изображение
+    и возвращает новый PDF из растровых страниц. Решает проблему с нестандартными
+    кириллическими шрифтами, которые PDF.js не умеет отображать."""
+    if not PYMUPDF_INSTALLED:
+        raise HTTPException(status_code=501, detail="PyMuPDF not available")
+
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"}:
+        raise HTTPException(status_code=400, detail="url must be http or https")
+
+    try:
+        downloaded = await _download_file(url)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Failed to download file: {exc}") from exc
+
+    try:
+        def _rasterize(local_path: str) -> bytes:
+            src = fitz.open(local_path)
+            out = fitz.open()
+            DPI = 150
+            scale = DPI / 72
+            mat = fitz.Matrix(scale, scale)
+            for page in src:
+                pix = page.get_pixmap(matrix=mat, alpha=False)
+                # Page size in pts at 72dpi
+                pw = pix.width * 72 / DPI
+                ph = pix.height * 72 / DPI
+                out_page = out.new_page(width=pw, height=ph)
+                out_page.insert_image(fitz.Rect(0, 0, pw, ph), pixmap=pix)
+            src.close()
+            import io
+            buf = io.BytesIO()
+            out.save(buf, deflate=True, garbage=2)
+            out.close()
+            return buf.getvalue()
+
+        pdf_bytes = await to_thread.run_sync(lambda: _rasterize(downloaded.local_path))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"PDF rasterization failed: {exc}") from exc
+    finally:
+        _cleanup_downloaded_file(downloaded)
+
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": "inline; filename=preview.pdf"},
+    )
 
 
 @app.post("/extract")
