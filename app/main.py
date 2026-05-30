@@ -366,6 +366,81 @@ def _looks_like_docx(filename: str, content_type: str | None) -> bool:
     )
 
 
+def _looks_like_pdf(filename: str, content_type: str | None) -> bool:
+    normalized = (content_type or "").split(";", 1)[0].strip().lower()
+    suffix = Path(filename).suffix.lower()
+    return normalized == "application/pdf" or suffix == ".pdf"
+
+
+def _convert_pdf_to_structured_text(local_path: str) -> dict[str, Any]:
+    """Извлекает текст из PDF для передачи в LLM.
+
+    Сначала пробует извлечь текстовый слой через PyMuPDF.
+    Если PDF отсканированный (нет текстового слоя) — применяет Tesseract OCR.
+    Возвращает структурированный текст с маркерами [PAGE N].
+    """
+    if not PYMUPDF_INSTALLED:
+        return {"text": "", "page_count": 0, "ocr_applied": False, "error": "PyMuPDF not installed"}
+
+    document = fitz.open(local_path)
+    page_count = document.page_count
+    lines: list[str] = []
+    ocr_applied = False
+
+    # Сначала пробуем обычный текстовый слой
+    all_pages_text: list[str] = []
+    for i in range(page_count):
+        page = document.load_page(i)
+        text = page.get_text("text", sort=True).strip()
+        all_pages_text.append(text)
+
+    has_text = any(len(t) > 20 for t in all_pages_text)
+
+    if has_text:
+        for i, text in enumerate(all_pages_text):
+            if text:
+                lines.append(f"[PAGE {i + 1}]")
+                lines.append(text)
+    else:
+        # Scanned PDF — пробуем Tesseract OCR
+        ocr_available = False
+        try:
+            import pytesseract
+            pytesseract.get_tesseract_version()
+            ocr_available = True
+        except Exception:
+            pass
+
+        if ocr_available:
+            from PIL import Image
+            import io
+            DPI = 200
+            try:
+                import pytesseract
+                for i in range(page_count):
+                    page = document.load_page(i)
+                    mat = fitz.Matrix(DPI / 72, DPI / 72)
+                    pix = page.get_pixmap(matrix=mat, alpha=False)
+                    img = Image.open(io.BytesIO(pix.tobytes("png")))
+                    text = pytesseract.image_to_string(img, lang="rus+eng").strip()
+                    if text:
+                        lines.append(f"[PAGE {i + 1}]")
+                        lines.append(text)
+                ocr_applied = True
+            except Exception as exc:
+                logger.warning("PDF OCR failed: %s", exc)
+
+    document.close()
+    raw_text = "\n".join(lines).strip()
+    # Убираем суррогатные символы (могут возникать при OCR) — они невалидны в JSON/UTF-8
+    clean_text = raw_text.encode("utf-8", errors="replace").decode("utf-8")
+    return {
+        "text": clean_text,
+        "page_count": page_count,
+        "ocr_applied": ocr_applied,
+    }
+
+
 def _guess_filename_from_url(file_url: str, content_type: Optional[str]) -> str:
     parsed_url = urlparse(file_url)
     raw_name = unquote(Path(parsed_url.path).name)
@@ -2212,8 +2287,15 @@ async def _extract_via_openrouter(payload: ExtractionRequest) -> dict[str, Any]:
 
     downloaded_file = await _download_file(payload.file_url)
     is_docx = _looks_like_docx(downloaded_file.filename, downloaded_file.content_type)
+    is_pdf = _looks_like_pdf(downloaded_file.filename, downloaded_file.content_type)
+    logger.info(
+        "File detected: filename=%r content_type=%r is_docx=%s is_pdf=%s",
+        downloaded_file.filename, downloaded_file.content_type, is_docx, is_pdf,
+    )
     docx_conversion_metadata: dict[str, Any] | None = None
+    pdf_conversion_metadata: dict[str, Any] | None = None
     docx_pdf_temp_dir: tempfile.TemporaryDirectory | None = None
+
     if is_docx:
         try:
             docx_conversion_metadata = await to_thread.run_sync(
@@ -2228,14 +2310,44 @@ async def _extract_via_openrouter(payload: ExtractionRequest) -> dict[str, Any]:
                     f"Extraction service traceback:\n{traceback.format_exc()}"
                 ),
             ) from exc
+    elif is_pdf and PYMUPDF_INSTALLED:
+        # Для PDF: сначала пробуем извлечь текст локально (searchable или OCR).
+        # Если текст получен — отправляем как текст (надёжнее, чем file-parser плагин).
+        # Если текст пустой — падаем обратно на file-parser (нативный путь OpenRouter).
+        try:
+            pdf_conversion_metadata = await to_thread.run_sync(
+                lambda: _convert_pdf_to_structured_text(downloaded_file.local_path)
+            )
+            logger.info(
+                "PDF text extraction: ocr_applied=%s text_len=%d",
+                pdf_conversion_metadata.get("ocr_applied"),
+                len(pdf_conversion_metadata.get("text") or ""),
+            )
+        except Exception as exc:
+            logger.warning("PDF text extraction failed, falling back to file-parser: %s", exc)
+            pdf_conversion_metadata = None
+
+    # Определяем текст документа для text-пути
+    use_text_path = False
+    document_text = ""
+    if is_docx and docx_conversion_metadata:
+        use_text_path = True
+        document_text = (docx_conversion_metadata or {}).get("text", "")
+    elif is_pdf and pdf_conversion_metadata:
+        extracted_text = pdf_conversion_metadata.get("text", "")
+        if extracted_text.strip():
+            use_text_path = True
+            document_text = extracted_text
+
+    logger.info("Extraction path: use_text_path=%s document_text_len=%d", use_text_path, len(document_text))
 
     messages = (
         _build_openrouter_messages_from_text(
             prompt=prompt,
-            document_text=(docx_conversion_metadata or {}).get("text", ""),
+            document_text=document_text,
             filename=downloaded_file.filename,
         )
-        if is_docx
+        if use_text_path
         else _build_openrouter_messages(
             prompt=prompt,
             downloaded_file=downloaded_file,
@@ -2252,7 +2364,8 @@ async def _extract_via_openrouter(payload: ExtractionRequest) -> dict[str, Any]:
     provider_preferences = _build_openrouter_provider_preferences(require_parameters=True)
     if provider_preferences:
         payload_json["provider"] = provider_preferences
-    if not is_docx and not _looks_like_image(downloaded_file.filename, downloaded_file.content_type):
+    # file-parser плагин добавляем только если не используем text-путь
+    if not use_text_path and not _looks_like_image(downloaded_file.filename, downloaded_file.content_type):
         payload_json["plugins"] = [
             {
                 "id": "file-parser",
@@ -2358,6 +2471,7 @@ async def _extract_via_openrouter(payload: ExtractionRequest) -> dict[str, Any]:
             "provider_usage": provider_response.get("usage"),
             "geometry": geometry_metadata,
             "docx_conversion": docx_conversion_metadata,
+            "pdf_conversion": pdf_conversion_metadata,
         },
     }
     return jsonable_encoder(response)
