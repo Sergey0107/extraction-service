@@ -1022,8 +1022,32 @@ def _search_exact_candidate_rects(page: Any, candidate: str) -> list[Any]:
     try:
         rects = page.search_for(snippet)
     except Exception:
-        return []
-    return sorted(rects, key=lambda rect: (float(rect.y0), float(rect.x0))) if rects else []
+        rects = []
+    if rects:
+        return sorted(rects, key=lambda rect: (float(rect.y0), float(rect.x0)))
+
+    # Fallback: если точный поиск не нашёл (из-за множественных пробелов в таблицах),
+    # нормализуем пробелы и ищем ещё раз
+    normalized = re.sub(r"\s+", " ", snippet).strip()
+    if normalized != snippet and len(normalized) >= 3:
+        try:
+            rects = page.search_for(normalized)
+        except Exception:
+            rects = []
+        if rects:
+            return sorted(rects, key=lambda rect: (float(rect.y0), float(rect.x0)))
+
+    # Fallback 2: ищем только первую значимую часть (до первого большого пробела)
+    parts = re.split(r"\s{2,}", snippet)
+    if len(parts) > 1 and len(parts[0].strip()) >= 4:
+        try:
+            rects = page.search_for(parts[0].strip())
+        except Exception:
+            rects = []
+        if rects:
+            return sorted(rects, key=lambda rect: (float(rect.y0), float(rect.x0)))
+
+    return []
 
 
 def _rect_center(rect: Any) -> tuple[float, float]:
