@@ -1,7 +1,6 @@
 import asyncio
 import base64
 import json
-import logging
 import mimetypes
 import os
 import re
@@ -10,10 +9,9 @@ import tempfile
 import time
 import traceback
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
-from typing import Any, Optional, Union
+from typing import Any, Optional
 from urllib.parse import unquote, urlparse
 
 import httpx
@@ -24,159 +22,42 @@ from docx.text.paragraph import Paragraph as WordParagraph
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import Response
 from fastapi.encoders import jsonable_encoder
-from pydantic import BaseModel, ConfigDict, Field
 
-try:
-    import fitz
-
-    PYMUPDF_INSTALLED = True
-except ImportError:
-    fitz = None
-    PYMUPDF_INSTALLED = False
-
-try:
-    from docling.datamodel.base_models import InputFormat
-    from docling.datamodel.pipeline_options import VlmConvertOptions, VlmPipelineOptions
-    from docling.datamodel.vlm_engine_options import ApiVlmEngineOptions, VlmEngineType
-    from docling.document_converter import DocumentConverter, PdfFormatOption
-    from docling.document_extractor import DocumentExtractor
-    from docling.pipeline.vlm_pipeline import VlmPipeline
-
-    try:
-        from docling.document_converter import ImageFormatOption
-    except ImportError:
-        ImageFormatOption = None
-    DOCLING_INSTALLED = True
-except ImportError:
-    InputFormat = None
-    VlmConvertOptions = Any
-    VlmPipelineOptions = Any
-    ApiVlmEngineOptions = Any
-    VlmEngineType = Any
-    DocumentExtractor = Any
-    DocumentConverter = Any
-    PdfFormatOption = Any
-    VlmPipeline = Any
-    ImageFormatOption = None
-    DOCLING_INSTALLED = False
-
-logger = logging.getLogger("extraction_service")
-logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
-
-
-def _get_env(name: str, default: Optional[str] = None) -> Optional[str]:
-    value = os.getenv(name)
-    if value is None or value == "":
-        return default
-    return value
-
-
-def _get_int_env(name: str, default: int) -> int:
-    value = _get_env(name)
-    if value is None:
-        return default
-    try:
-        return int(value)
-    except ValueError:
-        logger.warning("Invalid integer for %s=%r, using %s", name, value, default)
-        return default
-
-
-def _get_list_env(name: str) -> list[str]:
-    value = _get_env(name)
-    if not value:
-        return []
-    return [item.strip() for item in value.split(",") if item.strip()]
-
-
-DOC_PARSE_MODEL = _get_env("DOCLING_PARSE_MODEL", "docling")
-DOC_EXTRACT_MODEL = _get_env("DOCLING_EXTRACT_MODEL", "docling")
-EXTRACTION_BACKEND = (_get_env("EXTRACTION_BACKEND", "openrouter") or "openrouter").strip().lower()
-DEBUG_ERRORS = _get_env("DEBUG_ERRORS", "0") == "1"
-FILE_DOWNLOAD_TIMEOUT_SECONDS = _get_int_env("FILE_DOWNLOAD_TIMEOUT_SECONDS", 300)
-REMOTE_API_TIMEOUT_SECONDS = _get_int_env("REMOTE_API_TIMEOUT_SECONDS", 600)
-
-DOCLING_REMOTE_API_URL = _get_env("DOCLING_REMOTE_API_URL")
-DOCLING_REMOTE_VLM_URL = _get_env("DOCLING_REMOTE_VLM_URL", DOCLING_REMOTE_API_URL)
-DOCLING_REMOTE_LLM_URL = _get_env("DOCLING_REMOTE_LLM_URL", DOCLING_REMOTE_API_URL)
-DOCLING_REMOTE_API_KEY = _get_env("DOCLING_REMOTE_API_KEY")
-DOCLING_REMOTE_MODEL = _get_env("DOCLING_REMOTE_MODEL", "ibm-granite/granite-docling-258M")
-DOCLING_REMOTE_EXTRACTION_MODEL = (
-    _get_env("DOCLING_REMOTE_EXTRACTION_MODEL", DOCLING_REMOTE_MODEL)
-    or DOCLING_REMOTE_MODEL
+from app.config import (
+    ACTIVE_BACKENDS,
+    DEBUG_ERRORS,
+    DOCLING_INSTALLED,
+    EXTRACTION_BACKEND,
+    FILE_DOWNLOAD_TIMEOUT_SECONDS,
+    GENERIC_MIME_TYPES,
+    GEOMETRY_ENRICHMENT_ENABLED,
+    IMAGE_SUFFIXES,
+    LLAMAPARSE_API_KEY,
+    LLAMAPARSE_BASE_URL,
+    LLAMAPARSE_LANGUAGE,
+    LLAMAPARSE_MAX_RETRIES,
+    LLAMAPARSE_MAX_WAIT_SECONDS,
+    LLAMAPARSE_POLLING_INTERVAL,
+    LLAMAPARSE_REQUEST_TIMEOUT_SECONDS,
+    LLAMAPARSE_RESULT_TYPE,
+    OPENROUTER_API_KEY,
+    OPENROUTER_APP_NAME,
+    OPENROUTER_BASE_URL,
+    OPENROUTER_MAX_TOKENS,
+    OPENROUTER_MODEL,
+    OPENROUTER_PDF_ENGINE,
+    OPENROUTER_PROVIDER_IGNORE,
+    OPENROUTER_PROVIDER_ORDER,
+    OPENROUTER_SITE_URL,
+    PYMUPDF_INSTALLED,
+    REMOTE_API_TIMEOUT_SECONDS,
+    STUBBED_BACKENDS,
+    SUPPORTED_BACKENDS,
+    fitz,
+    logger,
 )
-DOCLING_REMOTE_PRESET = _get_env("DOCLING_REMOTE_PRESET", "granite_docling")
-DOCLING_REMOTE_MAX_TOKENS = _get_int_env("DOCLING_REMOTE_MAX_TOKENS", 4000)
-
-OPENROUTER_API_KEY = _get_env("OPENROUTER_API_KEY")
-OPENROUTER_MODEL = _get_env("OPENROUTER_MODEL", "openai/gpt-4o-mini")
-OPENROUTER_BASE_URL = _get_env("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
-OPENROUTER_PDF_ENGINE = _get_env("OPENROUTER_PDF_ENGINE", "mistral-ocr")
-OPENROUTER_MAX_TOKENS = min(_get_int_env("OPENROUTER_MAX_TOKENS", 4000), 8000)
-OPENROUTER_APP_NAME = _get_env("OPENROUTER_APP_NAME", "extraction-service")
-OPENROUTER_SITE_URL = _get_env("OPENROUTER_SITE_URL", "http://localhost:8005")
-OPENROUTER_PROVIDER_ORDER = _get_list_env("OPENROUTER_PROVIDER_ORDER")
-OPENROUTER_PROVIDER_IGNORE = _get_list_env("OPENROUTER_PROVIDER_IGNORE")
-GEOMETRY_ENRICHMENT_ENABLED = _get_env("GEOMETRY_ENRICHMENT_ENABLED", "1") != "0"
-
-LLAMAPARSE_API_KEY = _get_env("LLAMAPARSE_API_KEY")
-LLAMAPARSE_BASE_URL = _get_env("LLAMAPARSE_BASE_URL", "https://api.cloud.llamaindex.ai")
-LLAMAPARSE_RESULT_TYPE = _get_env("LLAMAPARSE_RESULT_TYPE", "markdown")
-LLAMAPARSE_POLLING_INTERVAL = _get_int_env("LLAMAPARSE_POLLING_INTERVAL", 3)
-LLAMAPARSE_MAX_WAIT_SECONDS = _get_int_env("LLAMAPARSE_MAX_WAIT_SECONDS", 180)
-LLAMAPARSE_LANGUAGE = _get_env("LLAMAPARSE_LANGUAGE", "ru")
-LLAMAPARSE_REQUEST_TIMEOUT_SECONDS = _get_int_env("LLAMAPARSE_REQUEST_TIMEOUT_SECONDS", 120)
-LLAMAPARSE_MAX_RETRIES = _get_int_env("LLAMAPARSE_MAX_RETRIES", 2)
-
-SUPPORTED_BACKENDS = {"docling_local", "docling_remote", "openrouter", "llamaparse"}
-ACTIVE_BACKENDS = {"openrouter", "llamaparse"}
-STUBBED_BACKENDS = SUPPORTED_BACKENDS - ACTIVE_BACKENDS
-if EXTRACTION_BACKEND not in ACTIVE_BACKENDS:
-    logger.warning(
-        "Backend %s is disabled in the current build; falling back to openrouter",
-        EXTRACTION_BACKEND,
-    )
-    EXTRACTION_BACKEND = "openrouter"
-ALLOWED_FORMATS = (InputFormat.IMAGE, InputFormat.PDF) if DOCLING_INSTALLED else tuple()
-IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff"}
-GENERIC_MIME_TYPES = {"application/octet-stream", "binary/octet-stream"}
-
-
-class ExtractionRequest(BaseModel):
-    model_config = ConfigDict(populate_by_name=True)
-
-    file_url: str = Field(..., description="Public or service-reachable file URL")
-    prompt: Optional[str] = None
-    schema_payload: Optional[Union[dict, str]] = Field(default=None, alias="schema")
-    analysis_id: Optional[str] = None
-    file_id: Optional[str] = None
-    file_type: Optional[str] = None
-    backend: Optional[str] = Field(
-        default=None,
-        description="docling_local | docling_remote | openrouter | llamaparse",
-    )
-
-
-@dataclass
-class DownloadedFile:
-    filename: str
-    content_type: Optional[str]
-    local_path: str
-    file_bytes: Optional[bytes] = None
-
-
-@dataclass
-class PdfWord:
-    text: str
-    normalized: str
-    rect: Any
-
-
-@dataclass
-class PdfPageIndex:
-    page_number: int
-    page: Any
-    words: list[PdfWord]
+from app.models import DownloadedFile, ExtractionRequest, PdfPageIndex, PdfWord
+from app.schema_utils import normalize_json_schema
 
 
 @asynccontextmanager
@@ -221,20 +102,6 @@ def _get_docling_version() -> Optional[str]:
         return None
 
 
-def _get_local_extractor() -> DocumentExtractor:
-    if not DOCLING_INSTALLED:
-        raise RuntimeError("Docling is not installed in this build")
-    extractor = getattr(app.state, "docling_extractor", None)
-    if extractor is None:
-        extractor = DocumentExtractor(allowed_formats=list(ALLOWED_FORMATS))
-        app.state.docling_extractor = extractor
-        logger.info(
-            "Local Docling extractor initialized with formats: %s",
-            [fmt.name for fmt in ALLOWED_FORMATS],
-        )
-    return extractor
-
-
 def _select_backend(requested_backend: Optional[str]) -> str:
     backend = (requested_backend or EXTRACTION_BACKEND).strip().lower()
     if backend not in SUPPORTED_BACKENDS:
@@ -253,99 +120,6 @@ def _raise_docling_backend_unavailable(backend: str) -> None:
             "Use 'openrouter'. Docling integration is kept as a stub for future re-enable."
         ),
     )
-
-
-def _build_default_template(prompt: Optional[str]) -> dict:
-    return {"result": "string"}
-
-
-def _build_default_json_schema(prompt: Optional[str]) -> dict[str, Any]:
-    description = prompt or "Structured extraction result"
-    return {
-        "type": "object",
-        "required": ["result"],
-        "additionalProperties": False,
-        "properties": {
-            "result": {
-                "type": "string",
-                "description": description,
-            }
-        },
-    }
-
-
-def _is_json_schema(schema: dict) -> bool:
-    return schema.get("type") == "object" and isinstance(schema.get("properties"), dict)
-
-
-def _json_schema_to_template(schema: dict) -> dict:
-    properties = schema.get("properties", {})
-    template: dict[str, Any] = {}
-    for key, prop_schema in properties.items():
-        template[key] = _json_schema_value_to_template(prop_schema)
-    return template
-
-
-def _json_schema_value_to_template(schema: Any) -> Any:
-    if not isinstance(schema, dict):
-        return "string"
-
-    schema_type = schema.get("type")
-    if isinstance(schema_type, list):
-        schema_type = next(
-            (value for value in schema_type if value != "null"),
-            schema_type[0] if schema_type else None,
-        )
-
-    if schema_type == "object":
-        return _json_schema_to_template(schema)
-    if schema_type == "array":
-        items = schema.get("items", {})
-        return [_json_schema_value_to_template(items)]
-    if schema_type == "number":
-        return "float"
-    if schema_type == "integer":
-        return "integer"
-    if schema_type == "boolean":
-        return "boolean"
-    if schema_type == "string":
-        return "string"
-    if "enum" in schema:
-        return "string"
-    return "string"
-
-
-def _normalize_template(
-    schema: Optional[Union[dict, str]],
-    prompt: Optional[str],
-) -> Union[dict, str]:
-    if isinstance(schema, dict):
-        return _json_schema_to_template(schema) if _is_json_schema(schema) else schema
-    if isinstance(schema, str):
-        try:
-            parsed = json.loads(schema)
-        except json.JSONDecodeError:
-            return schema
-        if isinstance(parsed, dict):
-            return _json_schema_to_template(parsed) if _is_json_schema(parsed) else parsed
-        return schema
-    return _build_default_template(prompt)
-
-
-def _normalize_json_schema(
-    schema: Optional[Union[dict, str]],
-    prompt: Optional[str],
-) -> dict[str, Any]:
-    if isinstance(schema, dict) and _is_json_schema(schema):
-        return schema
-    if isinstance(schema, str):
-        try:
-            parsed = json.loads(schema)
-        except json.JSONDecodeError:
-            return _build_default_json_schema(prompt)
-        if isinstance(parsed, dict) and _is_json_schema(parsed):
-            return parsed
-    return _build_default_json_schema(prompt)
 
 
 def _looks_like_image(filename: str, content_type: str | None) -> bool:
@@ -542,14 +316,6 @@ def _json_decode_diagnostic(
         f"response_metadata={json.dumps(metadata, ensure_ascii=True)}; "
         f"snippet_around_error={json.dumps(snippet, ensure_ascii=True)}"
     )
-
-
-def _parse_json_from_chat_response(data: dict[str, Any], *, provider_name: str) -> dict[str, Any]:
-    content = _extract_message_json_text(data, provider_name=provider_name)
-    parsed = json.loads(content)
-    if not isinstance(parsed, dict):
-        raise RuntimeError(f"{provider_name} returned non-object JSON")
-    return parsed
 
 
 def _extract_error_text_from_response(response: httpx.Response, provider_name: str) -> str:
@@ -1583,31 +1349,6 @@ def _build_result_page(
     }
 
 
-def _run_local_docling_extraction(
-    extractor: DocumentExtractor,
-    file_url: str,
-    template: Union[dict, str],
-):
-    return extractor.extract(source=file_url, template=template)
-
-
-def _serialize_pages(result: Any) -> list[dict[str, Any]]:
-    pages = getattr(result, "pages", None)
-    if not pages:
-        return []
-    serialized = []
-    for page in pages:
-        serialized.append(
-            {
-                "page_no": getattr(page, "page_no", None),
-                "extracted_data": getattr(page, "extracted_data", None),
-                "raw_text": getattr(page, "raw_text", None),
-                "errors": getattr(page, "errors", None),
-            }
-        )
-    return serialized
-
-
 def _build_openai_headers(api_key: Optional[str]) -> dict[str, str]:
     headers = {"Content-Type": "application/json"}
     if api_key:
@@ -1924,61 +1665,6 @@ def _build_openrouter_messages_from_text(
     ]
 
 
-def _build_docling_remote_converter() -> DocumentConverter:
-    if not DOCLING_INSTALLED:
-        raise RuntimeError("Docling is not installed in this build")
-    if not DOCLING_REMOTE_VLM_URL:
-        raise RuntimeError("DOCLING_REMOTE_VLM_URL is not set")
-
-    engine_options = ApiVlmEngineOptions(
-        runtime_type=VlmEngineType.API,
-        url=DOCLING_REMOTE_VLM_URL,
-        headers=_build_openai_headers(DOCLING_REMOTE_API_KEY),
-        params={
-            "model": DOCLING_REMOTE_MODEL,
-            "temperature": 0,
-        },
-    )
-    pipeline_options = VlmPipelineOptions(
-        enable_remote_services=True,
-        vlm_options=VlmConvertOptions.from_preset(
-            DOCLING_REMOTE_PRESET,
-            engine_options=engine_options,
-        ),
-    )
-    format_options: dict[InputFormat, Any] = {
-        InputFormat.PDF: PdfFormatOption(
-            pipeline_cls=VlmPipeline,
-            pipeline_options=pipeline_options,
-        )
-    }
-    if ImageFormatOption is not None:
-        format_options[InputFormat.IMAGE] = ImageFormatOption(
-            pipeline_cls=VlmPipeline,
-            pipeline_options=pipeline_options,
-        )
-    return DocumentConverter(format_options=format_options)
-
-
-def _run_docling_remote_conversion(local_path: str) -> str:
-    converter = _build_docling_remote_converter()
-    result = converter.convert(source=local_path)
-    document = getattr(result, "document", None)
-    if document is None:
-        raise RuntimeError("Docling remote conversion returned no document")
-    export_to_markdown = getattr(document, "export_to_markdown", None)
-    if callable(export_to_markdown):
-        markdown = export_to_markdown()
-        if isinstance(markdown, str) and markdown.strip():
-            return markdown
-    export_to_text = getattr(document, "export_to_text", None)
-    if callable(export_to_text):
-        text = export_to_text()
-        if isinstance(text, str) and text.strip():
-            return text
-    raise RuntimeError("Docling remote conversion returned empty document content")
-
-
 async def _llamaparse_upload(client: httpx.AsyncClient, local_path: str, filename: str) -> str:
     url = f"{LLAMAPARSE_BASE_URL.rstrip('/')}/api/parsing/upload"
     headers = {"Authorization": f"Bearer {LLAMAPARSE_API_KEY}"}
@@ -2145,7 +1831,7 @@ async def _extract_via_llamaparse(payload: ExtractionRequest) -> dict[str, Any]:
     if not payload.prompt and not payload.schema_payload:
         raise HTTPException(status_code=400, detail="schema or prompt is required")
 
-    schema = _normalize_json_schema(payload.schema_payload, payload.prompt)
+    schema = normalize_json_schema(payload.schema_payload, payload.prompt)
     prompt = payload.prompt or "Extract structured data from the document and return JSON."
     prompt = (
         f"{prompt}\n"
@@ -2319,7 +2005,7 @@ async def _extract_via_openrouter(payload: ExtractionRequest) -> dict[str, Any]:
     if not OPENROUTER_API_KEY:
         raise HTTPException(status_code=500, detail="OPENROUTER_API_KEY is not set")
 
-    schema = _normalize_json_schema(payload.schema_payload, payload.prompt)
+    schema = normalize_json_schema(payload.schema_payload, payload.prompt)
     prompt = payload.prompt or "Extract structured data from the document and return JSON."
     prompt = (
         f"{prompt}\n"
