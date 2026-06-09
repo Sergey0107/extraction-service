@@ -2525,33 +2525,57 @@ async def _get_render_lock(key: str) -> asyncio.Lock:
         return lock
 
 
-def _pdf_needs_rasterization(local_path: str) -> bool:
-    """Решает, нужна ли растеризация PDF для превью.
+def _classify_pdf_for_preview(local_path: str) -> dict[str, bool]:
+    """Классифицирует PDF для превью: что с ним не так и нужна ли растеризация.
 
-    Растеризация нужна ТОЛЬКО для PDF с НЕвстроенными шрифтами — именно их PDF.js
-    не умеет корректно показывать (кириллица «плывёт»). Если все шрифты встроены
-    (обычный случай) — PDF.js покажет оригинал сам, постранично и быстро; тяжёлая
-    растеризация всего документа не нужна (она и тормозила превью).
-    Сканы без шрифтов (картинки) PDF.js тоже показывает нормально → не растеризуем.
-    При любой ошибке/сомнении возвращаем True (безопасный путь — как было раньше)."""
+    Растеризуем (с выпрямлением), если документ показался бы криво или подсветка
+    не совпала бы с координатами:
+      - rotated:  есть страницы с поворотом (/Rotate != 0) → вьювер покажет боком;
+      - garbled:  текстовый слой — мусор (битая кодировка шрифта);
+      - non_embedded_fonts: есть невстроенные НЕстандартные шрифты (PDF.js «плывёт»).
+    Чистый PDF (встроенные шрифты/стандартные, без поворота, читаемый текст) —
+    отдаём оригинал как есть (быстро, постранично, текст выделяется)."""
+    info = {"rotated": False, "garbled": False, "non_embedded_fonts": False, "needs_rasterization": False}
+    # Стандартные 14 base-шрифтов PDF — PDF.js рисует их сам, растеризация не нужна.
+    standard14 = {
+        "helvetica", "courier", "times", "symbol", "zapfdingbats", "arial",
+    }
     try:
         doc = fitz.open(local_path)
         try:
             pages_to_check = min(doc.page_count, 15)
+            text_parts: list[str] = []
             for i in range(pages_to_check):
+                page = doc.load_page(i)
+                if page.rotation:
+                    info["rotated"] = True
+                text_parts.append(page.get_text("text", sort=True))
                 for font in doc.get_page_fonts(i):
                     # font = (xref, ext, type, basefont, name, encoding)
-                    ext = font[1]
-                    if not ext:  # шрифт НЕ встроен → PDF.js может не отрисовать
-                        return True
-            # Дошли сюда: все встреченные шрифты встроены (или шрифтов нет вовсе —
-            # скан-картинка). Растеризация не нужна.
-            return False
+                    ext = (font[1] or "").strip().lower()
+                    base = (font[3] or "").lower()
+                    embedded = ext not in ("", "n/a")
+                    is_standard = any(s in base for s in standard14)
+                    if not embedded and not is_standard:
+                        info["non_embedded_fonts"] = True
+            combined = "\n".join(t for t in text_parts if t)
+            if len(combined) > 50 and not _text_layer_is_usable(combined):
+                info["garbled"] = True
         finally:
             doc.close()
     except Exception:
-        logger.warning("Font check failed, falling back to rasterization", exc_info=True)
-        return True
+        logger.warning("PDF classification failed, defaulting to rasterization", exc_info=True)
+        info["needs_rasterization"] = True
+        return info
+
+    info["needs_rasterization"] = (
+        info["rotated"] or info["garbled"] or info["non_embedded_fonts"]
+    )
+    return info
+
+
+def _pdf_needs_rasterization(local_path: str) -> bool:
+    return _classify_pdf_for_preview(local_path)["needs_rasterization"]
 
 
 def _rasterize_pdf(local_path: str, auto_orient: bool = False) -> bytes:
