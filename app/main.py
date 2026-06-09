@@ -205,6 +205,21 @@ def _text_layer_is_usable(text: str) -> bool:
     return word_ratio >= 0.6
 
 
+def _page_words_are_usable(pages: list["PdfPageIndex"]) -> bool:
+    """Проверяет, что слова в текстовом индексе страниц — осмысленные, а не мусор.
+
+    Используется геометрией: текстовый слой может «существовать» (слова есть), но
+    из-за битой кодировки шрифта это мешанина одиночных символов. По такому индексу
+    цитаты не находятся → 0 координат → клик по характеристике ничего не делает.
+    Если слова мусорные — геометрия должна перейти на OCR-индекс."""
+    sample = " ".join(
+        word.text
+        for page in pages
+        for word in page.words
+    )
+    return _text_layer_is_usable(sample)
+
+
 def _convert_pdf_to_structured_text(local_path: str) -> dict[str, Any]:
     """Извлекает текст из PDF для передачи в LLM.
 
@@ -801,6 +816,14 @@ def _collect_reference_candidates(
     return deduped[:8]
 
 
+def _page_index_rect(page_index: "PdfPageIndex") -> Any:
+    """Система координат для нормализации bbox страницы: для OCR-индекса с
+    авто-поворотом — прямоугольник выпрямленного изображения, иначе — page.rect."""
+    if getattr(page_index, "page_rect", None) is not None:
+        return page_index.page_rect
+    return page_index.page.rect
+
+
 def _rect_to_bbox(rect: Any, page_rect: Any = None) -> dict[str, float]:
     result: dict[str, float] = {
         "x": round(float(rect.x0), 3),
@@ -881,6 +904,13 @@ def _build_pdf_page_index_ocr(local_path: str) -> tuple[Any, list[PdfPageIndex]]
         pix = page.get_pixmap(matrix=mat, alpha=False)
         img_bytes = pix.tobytes("png")
         img = Image.open(io.BytesIO(img_bytes))
+        # Выпрямляем страницу (повёрнутые сканы) — иначе OCR читает текст боком/
+        # вверх ногами и выдаёт мусор, а координаты не совпадут с вьювером.
+        img = _auto_orient_for_ocr(img)
+        # Прямоугольник системы координат = размер ВЫПРЯМЛЕННОГО изображения в
+        # PDF-пунктах. Именно в этой системе фронт нормализует bbox.
+        scale = 72.0 / DPI  # pixels -> PDF points
+        page_rect = fitz.Rect(0, 0, img.width * scale, img.height * scale)
 
         try:
             ocr_data = pytesseract.image_to_data(
@@ -890,10 +920,11 @@ def _build_pdf_page_index_ocr(local_path: str) -> tuple[Any, list[PdfPageIndex]]
             )
         except Exception as exc:
             logger.warning("OCR failed for page %d: %s", page_index + 1, exc)
-            pages.append(PdfPageIndex(page_number=page_index + 1, page=page, words=[]))
+            pages.append(
+                PdfPageIndex(page_number=page_index + 1, page=page, words=[], page_rect=page_rect)
+            )
             continue
 
-        scale = 72.0 / DPI  # pixels -> PDF points
         words: list[PdfWord] = []
         n = len(ocr_data["text"])
         for i in range(n):
@@ -911,7 +942,9 @@ def _build_pdf_page_index_ocr(local_path: str) -> tuple[Any, list[PdfPageIndex]]
             rect = fitz.Rect(x, y, x + w, y + h)
             words.append(PdfWord(text=text, normalized=normalized, rect=rect))
 
-        pages.append(PdfPageIndex(page_number=page_index + 1, page=page, words=words))
+        pages.append(
+            PdfPageIndex(page_number=page_index + 1, page=page, words=words, page_rect=page_rect)
+        )
 
     return document, pages
 
@@ -1263,7 +1296,7 @@ def _find_reference_location(
             if not best_match or score > best_match["score"]:
                 best_match = {
                     "page": page_index.page_number,
-                    "bbox": _rect_to_bbox(rect, page_index.page.rect),
+                    "bbox": _rect_to_bbox(rect, _page_index_rect(page_index)),
                     "score": score,
                     "locator_strategy": "pymupdf_exact",
                     "matched_text": candidate_text,
@@ -1300,7 +1333,7 @@ def _find_reference_location(
             if not best_match or score > best_match["score"]:
                 best_match = {
                     "page": page_index.page_number,
-                    "bbox": _rect_to_bbox(rect, page_index.page.rect),
+                    "bbox": _rect_to_bbox(rect, _page_index_rect(page_index)),
                     "score": score,
                     "locator_strategy": "pymupdf_tokens",
                     "matched_text": candidate_text,
@@ -1339,7 +1372,7 @@ def _find_reference_location(
             if not best_match or score > best_match["score"]:
                 best_match = {
                     "page": page_index.page_number,
-                    "bbox": _rect_to_bbox(rect, page_index.page.rect),
+                    "bbox": _rect_to_bbox(rect, _page_index_rect(page_index)),
                     "score": score,
                     "locator_strategy": "table_row",
                     "matched_text": candidate_text,
@@ -1381,7 +1414,7 @@ def _find_reference_location(
             if not best_match or score > best_match["score"]:
                 best_match = {
                     "page": top_page_index.page_number,
-                    "bbox": _rect_to_bbox(top_rect, top_page_index.page.rect),
+                    "bbox": _rect_to_bbox(top_rect, _page_index_rect(top_page_index)),
                     "score": score,
                     "locator_strategy": "pymupdf_fuzzy",
                     "matched_text": candidate_text,
@@ -1456,9 +1489,17 @@ def _enrich_references_with_pdf_geometry(
     try:
         document, pages = _build_pdf_page_index(local_path)
         metadata["page_count"] = document.page_count
-        metadata["searchable_pdf"] = any(page.words for page in pages)
+        # Текстовый слой годен, только если слова осмысленные. У PDF с битой
+        # кодировкой шрифта слова «есть», но это мусор — по нему цитаты не
+        # находятся (0 координат, клик не работает). Тогда падаем на OCR.
+        has_words = any(page.words for page in pages)
+        text_layer_usable = has_words and _page_words_are_usable(pages)
+        if has_words and not text_layer_usable:
+            metadata["garbled_text_layer"] = True
+            logger.info("Geometry: text layer garbled — falling back to OCR index")
+        metadata["searchable_pdf"] = text_layer_usable
         if not metadata["searchable_pdf"]:
-            # Attempt OCR fallback for scanned PDFs
+            # Attempt OCR fallback for scanned PDFs OR garbled text layer
             ocr_available = False
             try:
                 import pytesseract
@@ -2513,13 +2554,18 @@ def _pdf_needs_rasterization(local_path: str) -> bool:
         return True
 
 
-def _rasterize_pdf(local_path: str) -> bytes:
+def _rasterize_pdf(local_path: str, auto_orient: bool = False) -> bytes:
     """Растеризует каждую страницу PDF в JPEG и собирает новый PDF.
 
     Страницы вставляются как JPEG (а не lossless): размер итогового PDF в разы
     меньше, что критично для скорости загрузки превью на медленном интернете.
-    DPI и качество JPEG настраиваются через RENDER_PDF_DPI / RENDER_PDF_JPEG_QUALITY."""
+    DPI и качество JPEG настраиваются через RENDER_PDF_DPI / RENDER_PDF_JPEG_QUALITY.
+
+    auto_orient=True — выпрямляет повёрнутые страницы (через OSD), чтобы вьювер
+    показывал документ прямо И в той же ориентации, в которой геометрия привязала
+    координаты (иначе подсветка не совпадёт)."""
     import io
+    from PIL import Image
 
     src = fitz.open(local_path)
     out = fitz.open()
@@ -2528,12 +2574,16 @@ def _rasterize_pdf(local_path: str) -> bytes:
     mat = fitz.Matrix(scale, scale)
     for page in src:
         pix = page.get_pixmap(matrix=mat, alpha=False)
-        # Размер страницы в пунктах при 72 dpi
-        pw = pix.width * 72 / dpi
-        ph = pix.height * 72 / dpi
-        jpeg_bytes = pix.tobytes("jpeg", jpg_quality=RENDER_PDF_JPEG_QUALITY)
+        img = Image.open(io.BytesIO(pix.tobytes("png")))
+        if auto_orient:
+            img = _auto_orient_for_ocr(img)
+        # Размер страницы в пунктах при 72 dpi (после возможного поворота)
+        pw = img.width * 72 / dpi
+        ph = img.height * 72 / dpi
+        jpeg_buf = io.BytesIO()
+        img.convert("RGB").save(jpeg_buf, format="JPEG", quality=RENDER_PDF_JPEG_QUALITY)
         out_page = out.new_page(width=pw, height=ph)
-        out_page.insert_image(fitz.Rect(0, 0, pw, ph), stream=jpeg_bytes)
+        out_page.insert_image(fitz.Rect(0, 0, pw, ph), stream=jpeg_buf.getvalue())
     src.close()
     buf = io.BytesIO()
     # JPEG уже сжат — deflate на поток картинок не нужен, только чистим объекты.
@@ -2594,8 +2644,10 @@ async def render_pdf(url: str) -> Response:
                 lambda: _pdf_needs_rasterization(downloaded.local_path)
             )
             if needs_raster:
+                # Растеризуем с авто-поворотом: вьювер покажет документ прямо и в
+                # той же ориентации, в которой геометрия привязала координаты.
                 pdf_bytes = await to_thread.run_sync(
-                    lambda: _rasterize_pdf(downloaded.local_path)
+                    lambda: _rasterize_pdf(downloaded.local_path, auto_orient=True)
                 )
             else:
                 pdf_bytes = await to_thread.run_sync(
