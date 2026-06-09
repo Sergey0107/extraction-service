@@ -79,6 +79,18 @@ EXTRACTION_BACKEND = (get_env("EXTRACTION_BACKEND", "openrouter") or "openrouter
 DEBUG_ERRORS = get_env("DEBUG_ERRORS", "0") == "1"
 FILE_DOWNLOAD_TIMEOUT_SECONDS = get_int_env("FILE_DOWNLOAD_TIMEOUT_SECONDS", 300)
 REMOTE_API_TIMEOUT_SECONDS = get_int_env("REMOTE_API_TIMEOUT_SECONDS", 600)
+# Лимит одновременных CPU-тяжёлых операций (растеризация PDF, OCR, геометрия,
+# конвертация DOCX). По умолчанию — число ядер минус одно (оставляем ядро под
+# event loop / health), но не меньше 2. Защищает от сатурации CPU и каскада
+# ReadTimeout→retry при множестве параллельных запросов.
+HEAVY_WORK_CONCURRENCY = get_int_env(
+    "HEAVY_WORK_CONCURRENCY", max(2, (os.cpu_count() or 2) - 1)
+)
+# Параметры растеризации превью PDF (/render-pdf). Страницы рендерятся в JPEG —
+# это в разы меньше по размеру, чем lossless, что критично для скорости загрузки
+# превью на медленном интернете (50 стр. ≈ 12 МБ lossless → ~2 МБ JPEG).
+RENDER_PDF_DPI = get_int_env("RENDER_PDF_DPI", 120)
+RENDER_PDF_JPEG_QUALITY = get_int_env("RENDER_PDF_JPEG_QUALITY", 75)
 
 DOCLING_REMOTE_API_URL = get_env("DOCLING_REMOTE_API_URL")
 DOCLING_REMOTE_VLM_URL = get_env("DOCLING_REMOTE_VLM_URL", DOCLING_REMOTE_API_URL)

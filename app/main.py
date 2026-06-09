@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import hashlib
 import json
 import mimetypes
 import os
@@ -30,6 +31,9 @@ from app.config import (
     EXTRACTION_BACKEND,
     FILE_DOWNLOAD_TIMEOUT_SECONDS,
     GENERIC_MIME_TYPES,
+    HEAVY_WORK_CONCURRENCY,
+    RENDER_PDF_DPI,
+    RENDER_PDF_JPEG_QUALITY,
     GEOMETRY_ENRICHMENT_ENABLED,
     IMAGE_SUFFIXES,
     LLAMAPARSE_API_KEY,
@@ -63,6 +67,15 @@ from app.schema_utils import normalize_json_schema
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     app.state.docling_extractor = None
+    # Ограничиваем число одновременных CPU-тяжёлых операций в пуле потоков anyio
+    # (по умолчанию их лимит 40 — это оверсабскрайбит малое число ядер и приводит
+    # к сатурации CPU и таймаутам). Все наши to_thread.run_sync (растеризация,
+    # OCR, геометрия, docx→pdf) идут через этот лимитёр.
+    try:
+        to_thread.current_default_thread_limiter().total_tokens = HEAVY_WORK_CONCURRENCY
+        logger.info("Heavy-work concurrency limited to %s", HEAVY_WORK_CONCURRENCY)
+    except Exception:
+        logger.warning("Failed to set thread limiter", exc_info=True)
     logger.info("Extraction service started; default backend=%s", EXTRACTION_BACKEND)
     try:
         yield
@@ -147,11 +160,57 @@ def _looks_like_pdf(filename: str, content_type: str | None) -> bool:
     return normalized == "application/pdf" or suffix == ".pdf"
 
 
+def _auto_orient_for_ocr(img):
+    """Доворачивает изображение страницы в правильную ориентацию перед OCR.
+
+    Некоторые PDF имеют повёрнутые страницы (rotation 90/270): после рендера в
+    картинку текст оказывается боком/вверх ногами, и Tesseract выдаёт мусор.
+    Через OSD определяем угол и доворачиваем. При ошибке/низкой уверенности —
+    возвращаем как есть (не хуже прежнего поведения)."""
+    try:
+        import pytesseract
+
+        osd = pytesseract.image_to_osd(img, output_type=pytesseract.Output.DICT)
+        rotate = int(osd.get("rotate", 0) or 0)
+        conf = float(osd.get("orientation_conf", 0) or 0)
+        if rotate and conf >= 1.0:
+            # PIL.rotate крутит против часовой; OSD 'rotate' — на сколько повернуть
+            # ПО часовой, чтобы выпрямить → используем expand и отрицательный угол.
+            return img.rotate(-rotate, expand=True)
+    except Exception:
+        pass
+    return img
+
+
+def _text_layer_is_usable(text: str) -> bool:
+    """Проверяет, что извлечённый текстовый слой ОСМЫСЛЕННЫЙ, а не «мусор».
+
+    У некоторых PDF шрифт со сломанной кодировкой (нет/битый ToUnicode): визуально
+    документ читается, но get_text() возвращает мешанину одиночных символов вроде
+    'u E e 5 ^s * 2 FE'. Такой текст нельзя слать в LLM — он не найдёт ни одной
+    характеристики. Признак мусора: мало «слов» (последовательностей букв >=3).
+    Тогда лучше упасть на OCR (он читает отрисованные глифы, а не битую кодировку).
+    """
+    stripped = text.strip()
+    if len(stripped) < 200:
+        # Слишком мало текста, чтобы судить о качестве — не блокируем (OCR решит по длине).
+        return len(stripped) > 20
+    letters = re.findall(r"[^\W\d_]", stripped, re.UNICODE)
+    if not letters:
+        return False
+    words = re.findall(r"[^\W\d_]{3,}", stripped, re.UNICODE)
+    letters_in_words = sum(len(w) for w in words)
+    word_ratio = letters_in_words / len(letters)
+    # У нормального текста (RU/EN) word_ratio ~0.9; у мусора-кодировки ~0.4-0.5.
+    return word_ratio >= 0.6
+
+
 def _convert_pdf_to_structured_text(local_path: str) -> dict[str, Any]:
     """Извлекает текст из PDF для передачи в LLM.
 
     Сначала пробует извлечь текстовый слой через PyMuPDF.
-    Если PDF отсканированный (нет текстового слоя) — применяет Tesseract OCR.
+    Если PDF отсканированный (нет текстового слоя) ИЛИ текстовый слой «мусорный»
+    (битая кодировка шрифта) — применяет Tesseract OCR.
     Возвращает структурированный текст с маркерами [PAGE N].
     """
     if not PYMUPDF_INSTALLED:
@@ -169,7 +228,11 @@ def _convert_pdf_to_structured_text(local_path: str) -> dict[str, Any]:
         text = page.get_text("text", sort=True).strip()
         all_pages_text.append(text)
 
-    has_text = any(len(t) > 20 for t in all_pages_text)
+    combined_text = "\n".join(t for t in all_pages_text if t)
+    # Текстовый слой используем, только если он есть И осмысленный (не битая кодировка).
+    has_text = len(combined_text) > 20 and _text_layer_is_usable(combined_text)
+    if len(combined_text) > 20 and not has_text:
+        logger.info("PDF text layer looks garbled (broken font encoding) — falling back to OCR")
 
     if has_text:
         for i, text in enumerate(all_pages_text):
@@ -197,6 +260,7 @@ def _convert_pdf_to_structured_text(local_path: str) -> dict[str, Any]:
                     mat = fitz.Matrix(DPI / 72, DPI / 72)
                     pix = page.get_pixmap(matrix=mat, alpha=False)
                     img = Image.open(io.BytesIO(pix.tobytes("png")))
+                    img = _auto_orient_for_ocr(img)
                     text = pytesseract.image_to_string(img, lang="rus+eng").strip()
                     if text:
                         lines.append(f"[PAGE {i + 1}]")
@@ -422,6 +486,28 @@ def _tokenize_match_text(value: str | None) -> list[str]:
     return [token for token in normalized.split(" ") if len(token) >= 2]
 
 
+def _matched_text_consistent_with_quote(
+    matched_text: str | None, quote_text: str | None
+) -> bool:
+    """True, если matched_text согласуется с quote_text (один — подстрока другого).
+
+    Зеркалит проверку фронтенда (isFallbackAnchor): если геометрия нашла текст,
+    не совпадающий с цитатой, фронт прячет такую подсветку как «обманчивую».
+    Возвращаем True только когда matched_text реально соответствует цитате —
+    тогда его безопасно выставлять. Для таблиц (нашли строку по названию, а
+    quote — это значение) вернём False, и matched_text не сохранится, чтобы
+    корректный bbox не был отброшен фронтендом."""
+    if not matched_text or not quote_text:
+        return False
+    norm_matched = _normalize_match_text(matched_text)
+    norm_quote = _normalize_match_text(quote_text)
+    if not norm_matched or not norm_quote:
+        return False
+    if norm_matched == norm_quote:
+        return True
+    return norm_quote in norm_matched or norm_matched in norm_quote
+
+
 def _safe_page_number(value: Any) -> int | None:
     if value is None or value == "":
         return None
@@ -463,6 +549,49 @@ def _reference_iter(node: Any):
     elif isinstance(node, list):
         for value in node:
             yield from _reference_iter(value)
+
+
+def _collect_generic_anchor_texts(root: Any) -> set[str]:
+    """Находит «общие» anchor/locator-тексты, которые нельзя использовать как
+    привязку к месту в PDF.
+
+    Типичная проблема: LLM ставит одинаковый anchor_text (название изделия,
+    например «Гидрант пожарный») для ВСЕХ характеристик. Геометрия тогда находит
+    этот заголовок один раз на стр. 1 и сажает туда все характеристики.
+    Считаем такими «общими» якорями: (1) названия изделий (product_name) и
+    (2) anchor/locator-тексты, повторяющиеся в >=2 референсах."""
+    generic: set[str] = set()
+    counts: dict[str, int] = {}
+
+    def walk(node: Any) -> None:
+        if isinstance(node, dict):
+            for key in ("product_name", "product_model"):
+                value = node.get(key)
+                if isinstance(value, str):
+                    norm = _normalize_match_text(value)
+                    if norm:
+                        generic.add(norm)
+            references = node.get("references")
+            if isinstance(references, list):
+                for reference in references:
+                    if not isinstance(reference, dict):
+                        continue
+                    for key in ("anchor_text", "locator_text"):
+                        value = reference.get(key)
+                        if isinstance(value, str):
+                            norm = _normalize_match_text(value)
+                            if norm:
+                                counts[norm] = counts.get(norm, 0) + 1
+            for key, value in node.items():
+                if key != "references":
+                    walk(value)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value)
+
+    walk(root)
+    generic.update(text for text, count in counts.items() if count >= 2)
+    return generic
 
 
 def _reference_iter_with_ancestors(node: Any, ancestors: tuple[dict[str, Any], ...] = ()):
@@ -591,8 +720,10 @@ def _collect_reference_candidates(
     *,
     label_context: list[str],
     value_context: list[str],
+    generic_anchors: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     raw_candidates: list[dict[str, Any]] = []
+    generic_anchors = generic_anchors or set()
     page_hint = None
     if isinstance(reference, dict):
         page_hint = _safe_page_number(reference.get("page"))
@@ -601,6 +732,11 @@ def _collect_reference_candidates(
         for key in ("quote_text", "anchor_text", "locator_text", "text"):
             value = reference.get(key)
             if isinstance(value, str) and value.strip():
+                # Пропускаем «общие» якоря (название изделия и т.п.): по ним нельзя
+                # позиционировать конкретную характеристику — иначе все они сядут
+                # в одно место (заголовок на стр. 1).
+                if key in {"anchor_text", "locator_text"} and _normalize_match_text(value) in generic_anchors:
+                    continue
                 raw_candidates.append(
                     {
                         "text": value.strip(),
@@ -895,6 +1031,55 @@ def _search_token_candidate(page_index: PdfPageIndex, candidate: str) -> tuple[A
     return rect, best_coverage
 
 
+def _search_fuzzy_token_candidate(
+    page_index: PdfPageIndex, candidate: str
+) -> tuple[Any | None, float]:
+    """OCR-устойчивый поиск с привязкой к ОДНОМУ компактному месту на странице.
+
+    Берём только различительные токены цитаты (длиной >= 4: имена характеристик,
+    а не служебные «не»/«до» и не голые числа, которые встречаются по всей странице),
+    и ищем тесное непрерывное окно слов, где встречается большинство из них.
+    Так мы избегаем ложных совпадений «по разбросанным общим словам», которые
+    давали одинаковый счёт на разных страницах. Возвращает прямоугольник найденного
+    места и долю совпавших различительных токенов."""
+    distinctive = [token for token in _tokenize_match_text(candidate) if len(token) >= 4]
+    if len(distinctive) < 2 or not page_index.words:
+        return None, 0.0
+
+    token_set = set(distinctive)
+    word_norms = [word.normalized for word in page_index.words]
+
+    def token_hits(word: str) -> str | None:
+        for token in token_set:
+            if word == token or (len(word) >= 4 and (token in word or word in token)):
+                return token
+        return None
+
+    # Узкое окно: совпадения должны идти кучно (одно место в документе),
+    # а не быть рассыпаны по всей странице.
+    window = len(distinctive) + 3
+    best_indices: list[int] = []
+    best_ratio = 0.0
+    for start in range(len(page_index.words)):
+        end = min(len(page_index.words), start + window)
+        hit_indices: list[int] = []
+        matched_tokens: set[str] = set()
+        for index in range(start, end):
+            token = token_hits(word_norms[index])
+            if token is not None and token not in matched_tokens:
+                matched_tokens.add(token)
+                hit_indices.append(index)
+        ratio = len(matched_tokens) / len(token_set)
+        if ratio > best_ratio or (ratio == best_ratio and len(hit_indices) < len(best_indices)):
+            best_ratio = ratio
+            best_indices = hit_indices
+
+    # Требуем уверенное совпадение: >=70% различительных токенов И минимум 2 из них.
+    if best_ratio < 0.7 or len(best_indices) < 2:
+        return None, 0.0
+
+    rect = _union_rects([page_index.words[index].rect for index in best_indices])
+    return rect, best_ratio
 
 
 def _token_overlap_ratio(a: str, b: str) -> float:
@@ -1160,6 +1345,48 @@ def _find_reference_location(
                     "matched_text": candidate_text,
                 }
 
+    # --- Fourth pass: OCR-устойчивый нечёткий поиск ---
+    # Срабатывает, когда точный/последовательный/табличный поиск ничего не нашли —
+    # типичная ситуация для сканов, где OCR искажает символы. Берём только
+    # содержательные кандидаты (цитата/значение), чтобы не цепляться за общий
+    # заголовок вроде "Технические характеристики".
+    if best_match is None:
+        fuzzy_candidates = [
+            c
+            for c in candidates
+            if c.get("kind") in {"quote_text", "value", "label_plus_value", "raw_reference"}
+            and not _is_generic_table_anchor(c)
+        ]
+        # Считаем нечёткое совпадение цитаты по каждой странице, затем выбираем
+        # лучшую — НО только если она заметно опережает остальные. Если на разных
+        # страницах совпадение почти одинаковое (распознались общие слова), позиция
+        # неоднозначна, и угадывать страницу нельзя — пропускаем (вернём None).
+        for candidate in fuzzy_candidates:
+            candidate_text = candidate["text"]
+            page_ratios: list[tuple[float, Any, Any]] = []
+            for page_index in pages:
+                rect, ratio = _search_fuzzy_token_candidate(page_index, candidate_text)
+                if rect:
+                    page_ratios.append((ratio, rect, page_index))
+            if not page_ratios:
+                continue
+            page_ratios.sort(key=lambda item: item[0], reverse=True)
+            top_ratio, top_rect, top_page_index = page_ratios[0]
+            runner_up = page_ratios[1][0] if len(page_ratios) > 1 else 0.0
+            # Неоднозначно: лучшая страница не опережает следующую хотя бы на 0.2.
+            if top_ratio - runner_up < 0.2:
+                continue
+            candidate_weight = float(candidate.get("weight", 0.5))
+            score = top_ratio * 60 * candidate_weight
+            if not best_match or score > best_match["score"]:
+                best_match = {
+                    "page": top_page_index.page_number,
+                    "bbox": _rect_to_bbox(top_rect, top_page_index.page.rect),
+                    "score": score,
+                    "locator_strategy": "pymupdf_fuzzy",
+                    "matched_text": candidate_text,
+                }
+
     return best_match
 
 
@@ -1261,6 +1488,7 @@ def _enrich_references_with_pdf_geometry(
 
         metadata["zero_based_normalized"] = _normalize_reference_pages(extracted_data)
         metadata["synthetic_reference_count"] = _inject_synthetic_references(extracted_data)
+        generic_anchors = _collect_generic_anchor_texts(extracted_data)
 
         for holder, references, ancestors in _reference_iter_with_ancestors(extracted_data):
             label_context = _collect_label_context(holder)
@@ -1284,12 +1512,24 @@ def _enrich_references_with_pdf_geometry(
                     reference,
                     label_context=label_context,
                     value_context=value_context,
+                    generic_anchors=generic_anchors,
                 )
                 if not candidates:
                     continue
 
                 match = _find_reference_location(pages, candidates, ancestor_context)
                 if not match:
+                    # Геометрия не смогла привязать цитату к месту в PDF.
+                    # Для сканов (OCR) номер страницы от LLM — это догадка
+                    # (обычно дефолтная "1"), показывать её как точную позицию нельзя:
+                    # это и приводило к тому, что все характеристики падали на стр. 1.
+                    # Помечаем референс как непроверенный и убираем недостоверную страницу.
+                    if metadata["ocr_applied"]:
+                        reference["page"] = None
+                        reference["page_number"] = None
+                    reference["position_unverified"] = True
+                    if isinstance(original_reference, dict):
+                        original_reference.update(reference)
                     continue
 
                 reference["page"] = match["page"]
@@ -1299,7 +1539,20 @@ def _enrich_references_with_pdf_geometry(
                 reference.setdefault("quote_text", candidates[0]["text"])
                 reference.setdefault("anchor_text", candidates[0]["text"])
                 reference["geometry_source"] = "pymupdf"
-                reference["matched_text"] = match.get("matched_text")
+                reference["position_unverified"] = False
+                # matched_text сохраняем только если он согласуется с quote_text.
+                # В таблицах геометрия часто находит строку по НАЗВАНИЮ характеристики
+                # ("Максимальный напор, м"), тогда как quote_text — это ЗНАЧЕНИЕ ("35").
+                # Это валидная привязка (нашли нужную строку, где значение и стоит),
+                # но фронтенд считает matched!=quote «обманчивым якорем» и прячет такие
+                # совпадения — из-за этого в паспорте отображалась лишь 1 характеристика.
+                # Чтобы не терять корректные bbox, в таком случае matched_text не выставляем.
+                matched_text = match.get("matched_text")
+                quote_text = reference.get("quote_text")
+                if _matched_text_consistent_with_quote(matched_text, quote_text):
+                    reference["matched_text"] = matched_text
+                else:
+                    reference.pop("matched_text", None)
                 reference["match_score"] = round(float(match.get("score", 0.0)), 3)
                 metadata["matched_reference_count"] += 1
 
@@ -2207,11 +2460,107 @@ async def _extract_via_openrouter(payload: ExtractionRequest) -> dict[str, Any]:
     return jsonable_encoder(response)
 
 
+RENDER_CACHE_DIR = Path(tempfile.gettempdir()) / "render_pdf_cache"
+# Блокировки на ключ кэша: пока один запрос растеризует документ, остальные
+# запросы того же документа ждут результат, а не запускают свою растеризацию.
+_render_locks: dict[str, asyncio.Lock] = {}
+_render_locks_guard = asyncio.Lock()
+
+
+def _render_cache_key(url: str) -> str:
+    """Ключ кэша по СТАБИЛЬНОЙ части URL (путь к объекту в S3), без подписи.
+    Presigned-URL для одного файла каждый раз разный (меняется signature), но
+    путь к объекту постоянен — кэшируем по нему."""
+    path = unquote(urlparse(url).path)
+    return hashlib.sha256(path.encode("utf-8")).hexdigest()
+
+
+async def _get_render_lock(key: str) -> asyncio.Lock:
+    async with _render_locks_guard:
+        lock = _render_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            _render_locks[key] = lock
+        return lock
+
+
+def _pdf_needs_rasterization(local_path: str) -> bool:
+    """Решает, нужна ли растеризация PDF для превью.
+
+    Растеризация нужна ТОЛЬКО для PDF с НЕвстроенными шрифтами — именно их PDF.js
+    не умеет корректно показывать (кириллица «плывёт»). Если все шрифты встроены
+    (обычный случай) — PDF.js покажет оригинал сам, постранично и быстро; тяжёлая
+    растеризация всего документа не нужна (она и тормозила превью).
+    Сканы без шрифтов (картинки) PDF.js тоже показывает нормально → не растеризуем.
+    При любой ошибке/сомнении возвращаем True (безопасный путь — как было раньше)."""
+    try:
+        doc = fitz.open(local_path)
+        try:
+            pages_to_check = min(doc.page_count, 15)
+            for i in range(pages_to_check):
+                for font in doc.get_page_fonts(i):
+                    # font = (xref, ext, type, basefont, name, encoding)
+                    ext = font[1]
+                    if not ext:  # шрифт НЕ встроен → PDF.js может не отрисовать
+                        return True
+            # Дошли сюда: все встреченные шрифты встроены (или шрифтов нет вовсе —
+            # скан-картинка). Растеризация не нужна.
+            return False
+        finally:
+            doc.close()
+    except Exception:
+        logger.warning("Font check failed, falling back to rasterization", exc_info=True)
+        return True
+
+
+def _rasterize_pdf(local_path: str) -> bytes:
+    """Растеризует каждую страницу PDF в JPEG и собирает новый PDF.
+
+    Страницы вставляются как JPEG (а не lossless): размер итогового PDF в разы
+    меньше, что критично для скорости загрузки превью на медленном интернете.
+    DPI и качество JPEG настраиваются через RENDER_PDF_DPI / RENDER_PDF_JPEG_QUALITY."""
+    import io
+
+    src = fitz.open(local_path)
+    out = fitz.open()
+    dpi = RENDER_PDF_DPI
+    scale = dpi / 72
+    mat = fitz.Matrix(scale, scale)
+    for page in src:
+        pix = page.get_pixmap(matrix=mat, alpha=False)
+        # Размер страницы в пунктах при 72 dpi
+        pw = pix.width * 72 / dpi
+        ph = pix.height * 72 / dpi
+        jpeg_bytes = pix.tobytes("jpeg", jpg_quality=RENDER_PDF_JPEG_QUALITY)
+        out_page = out.new_page(width=pw, height=ph)
+        out_page.insert_image(fitz.Rect(0, 0, pw, ph), stream=jpeg_bytes)
+    src.close()
+    buf = io.BytesIO()
+    # JPEG уже сжат — deflate на поток картинок не нужен, только чистим объекты.
+    out.save(buf, garbage=2)
+    out.close()
+    return buf.getvalue()
+
+
+def _render_response(pdf_bytes: bytes) -> Response:
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": "inline; filename=preview.pdf",
+            "Cache-Control": "private, max-age=3600",
+        },
+    )
+
+
 @app.get("/render-pdf")
 async def render_pdf(url: str) -> Response:
     """Скачивает PDF по URL, рендерит каждую страницу через PyMuPDF в изображение
     и возвращает новый PDF из растровых страниц. Решает проблему с нестандартными
-    кириллическими шрифтами, которые PDF.js не умеет отображать."""
+    кириллическими шрифтами, которые PDF.js не умеет отображать.
+
+    Результат кэшируется на диске по ключу объекта S3: повторные открытия того же
+    документа отдаются из кэша мгновенно, без повторной растеризации (она грузит CPU)."""
     if not PYMUPDF_INSTALLED:
         raise HTTPException(status_code=501, detail="PyMuPDF not available")
 
@@ -2219,43 +2568,53 @@ async def render_pdf(url: str) -> Response:
     if parsed.scheme not in {"http", "https"}:
         raise HTTPException(status_code=400, detail="url must be http or https")
 
-    try:
-        downloaded = await _download_file(url)
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Failed to download file: {exc}") from exc
+    cache_key = _render_cache_key(url)
+    cache_path = RENDER_CACHE_DIR / f"{cache_key}.pdf"
+    if cache_path.exists():
+        return _render_response(cache_path.read_bytes())
 
-    try:
-        def _rasterize(local_path: str) -> bytes:
-            src = fitz.open(local_path)
-            out = fitz.open()
-            DPI = 150
-            scale = DPI / 72
-            mat = fitz.Matrix(scale, scale)
-            for page in src:
-                pix = page.get_pixmap(matrix=mat, alpha=False)
-                # Page size in pts at 72dpi
-                pw = pix.width * 72 / DPI
-                ph = pix.height * 72 / DPI
-                out_page = out.new_page(width=pw, height=ph)
-                out_page.insert_image(fitz.Rect(0, 0, pw, ph), pixmap=pix)
-            src.close()
-            import io
-            buf = io.BytesIO()
-            out.save(buf, deflate=True, garbage=2)
-            out.close()
-            return buf.getvalue()
+    # Сериализуем растеризацию одного и того же документа: параллельные открытия
+    # не должны запускать N одновременных растеризаций (это и сатурировало CPU).
+    lock = await _get_render_lock(cache_key)
+    async with lock:
+        if cache_path.exists():
+            return _render_response(cache_path.read_bytes())
 
-        pdf_bytes = await to_thread.run_sync(lambda: _rasterize(downloaded.local_path))
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"PDF rasterization failed: {exc}") from exc
-    finally:
-        _cleanup_downloaded_file(downloaded)
+        try:
+            downloaded = await _download_file(url)
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"Failed to download file: {exc}") from exc
 
-    return Response(
-        content=pdf_bytes,
-        media_type="application/pdf",
-        headers={"Content-Disposition": "inline; filename=preview.pdf"},
-    )
+        try:
+            # Растеризуем ТОЛЬКО если это реально нужно (есть невстроенные шрифты).
+            # Для обычных PDF со встроенными шрифтами отдаём оригинал — PDF.js
+            # покажет его сам, постранично и быстро (без тяжёлой растеризации и
+            # без раздувания размера, которое тормозило превью на медленном инете).
+            needs_raster = await to_thread.run_sync(
+                lambda: _pdf_needs_rasterization(downloaded.local_path)
+            )
+            if needs_raster:
+                pdf_bytes = await to_thread.run_sync(
+                    lambda: _rasterize_pdf(downloaded.local_path)
+                )
+            else:
+                pdf_bytes = await to_thread.run_sync(
+                    lambda: Path(downloaded.local_path).read_bytes()
+                )
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"PDF rasterization failed: {exc}") from exc
+        finally:
+            _cleanup_downloaded_file(downloaded)
+
+        try:
+            RENDER_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            tmp_path = cache_path.with_suffix(".pdf.tmp")
+            tmp_path.write_bytes(pdf_bytes)
+            tmp_path.replace(cache_path)
+        except Exception as exc:
+            logger.warning("Failed to cache rendered PDF: %s", exc)
+
+    return _render_response(pdf_bytes)
 
 
 @app.post("/extract")
