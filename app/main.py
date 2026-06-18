@@ -2532,13 +2532,18 @@ def _classify_pdf_for_preview(local_path: str) -> dict[str, bool]:
     не совпала бы с координатами:
       - rotated:  есть страницы с поворотом (/Rotate != 0) → вьювер покажет боком;
       - garbled:  текстовый слой — мусор (битая кодировка шрифта);
-      - non_embedded_fonts: есть невстроенные НЕстандартные шрифты (PDF.js «плывёт»).
-    Чистый PDF (встроенные шрифты/стандартные, без поворота, читаемый текст) —
+      - non_embedded_fonts: есть шрифты, которые PDF.js не умеет рендерить.
+    Чистый PDF (только web-safe шрифты, без поворота, читаемый текст) —
     отдаём оригинал как есть (быстро, постранично, текст выделяется)."""
     info = {"rotated": False, "garbled": False, "non_embedded_fonts": False, "needs_rasterization": False}
-    # Стандартные 14 base-шрифтов PDF — PDF.js рисует их сам, растеризация не нужна.
-    standard14 = {
+    # Шрифты, которые PDF.js умеет рендерить сам без растеризации:
+    # стандартные 14 PDF-шрифтов + распространённые web-safe (latin-only).
+    # Любой другой встроенный шрифт (особенно кириллические TrueType вроде
+    # FuturisC, Helios, PragmaticaC и т.п.) PDF.js не отрисует — нужна растеризация.
+    pdfjs_safe_fonts = {
         "helvetica", "courier", "times", "symbol", "zapfdingbats", "arial",
+        "georgia", "verdana", "tahoma", "trebuchet", "impact",
+        "comic", "palatino", "garamond", "bookman", "avantgarde",
     }
     try:
         doc = fitz.open(local_path)
@@ -2554,9 +2559,11 @@ def _classify_pdf_for_preview(local_path: str) -> dict[str, bool]:
                     # font = (xref, ext, type, basefont, name, encoding)
                     ext = (font[1] or "").strip().lower()
                     base = (font[3] or "").lower()
-                    embedded = ext not in ("", "n/a")
-                    is_standard = any(s in base for s in standard14)
-                    if not embedded and not is_standard:
+                    is_pdfjs_safe = any(s in base for s in pdfjs_safe_fonts)
+                    # Растеризуем при любом шрифте вне web-safe списка: PDF.js не
+                    # умеет рендерить произвольные встроенные TrueType/Type1 из
+                    # PDF-потока — кириллические шрифты показываются квадратиками.
+                    if not is_pdfjs_safe:
                         info["non_embedded_fonts"] = True
             combined = "\n".join(t for t in text_parts if t)
             if len(combined) > 50 and not _text_layer_is_usable(combined):
