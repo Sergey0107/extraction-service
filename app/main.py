@@ -2834,9 +2834,15 @@ async def _extract_via_openrouter(payload: ExtractionRequest) -> dict[str, Any]:
         document_text = (docx_conversion_metadata or {}).get("text", "")
     elif is_pdf and pdf_conversion_metadata:
         extracted_text = pdf_conversion_metadata.get("text", "")
-        if extracted_text.strip():
+        ocr_was_applied = pdf_conversion_metadata.get("ocr_applied", False)
+        if extracted_text.strip() and not ocr_was_applied:
             use_text_path = True
             document_text = extracted_text
+        elif extracted_text.strip() and ocr_was_applied and LLM_IS_YANDEX:
+            use_text_path = True
+            document_text = extracted_text
+        elif extracted_text.strip() and ocr_was_applied:
+            logger.info("Scanned PDF: OCR text available but preferring file-parser for better table reading")
         elif LLM_IS_YANDEX:
             # Yandex doesn't support file content parts — if text extraction yielded nothing,
             # we still can't send the raw file; raise an informative error.
