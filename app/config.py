@@ -113,6 +113,9 @@ OPENROUTER_APP_NAME = get_env("OPENROUTER_APP_NAME", "extraction-service")
 OPENROUTER_SITE_URL = get_env("OPENROUTER_SITE_URL", "http://localhost:8005")
 OPENROUTER_PROVIDER_ORDER = get_list_env("OPENROUTER_PROVIDER_ORDER")
 OPENROUTER_PROVIDER_IGNORE = get_list_env("OPENROUTER_PROVIDER_IGNORE")
+
+# "openrouter" (default) or "yandex" — controls provider-specific request fields
+LLM_PROVIDER = (get_env("LLM_PROVIDER", "openrouter") or "openrouter").strip().lower()
 GEOMETRY_ENRICHMENT_ENABLED = get_env("GEOMETRY_ENRICHMENT_ENABLED", "1") != "0"
 
 LLAMAPARSE_API_KEY = get_env("LLAMAPARSE_API_KEY")
@@ -133,6 +136,10 @@ if EXTRACTION_BACKEND not in ACTIVE_BACKENDS:
         EXTRACTION_BACKEND,
     )
     EXTRACTION_BACKEND = "openrouter"
+
+# True when using a provider that doesn't support OpenRouter-specific extensions
+# (provider routing, plugins, json_schema response_format with strict).
+LLM_IS_YANDEX = LLM_PROVIDER == "yandex"
 ALLOWED_FORMATS = (InputFormat.IMAGE, InputFormat.PDF) if DOCLING_INSTALLED else tuple()
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff"}
 GENERIC_MIME_TYPES = {"application/octet-stream", "binary/octet-stream"}

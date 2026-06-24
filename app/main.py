@@ -44,6 +44,7 @@ from app.config import (
     LLAMAPARSE_POLLING_INTERVAL,
     LLAMAPARSE_REQUEST_TIMEOUT_SECONDS,
     LLAMAPARSE_RESULT_TYPE,
+    LLM_IS_YANDEX,
     OPENROUTER_API_KEY,
     OPENROUTER_APP_NAME,
     OPENROUTER_BASE_URL,
@@ -64,13 +65,12 @@ from app.models import DownloadedFile, ExtractionRequest, PdfPageIndex, PdfWord
 from app.schema_utils import normalize_json_schema
 
 
+_strict_schema_supported: dict[str, bool] = {}
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     app.state.docling_extractor = None
-    # Ограничиваем число одновременных CPU-тяжёлых операций в пуле потоков anyio
-    # (по умолчанию их лимит 40 — это оверсабскрайбит малое число ядер и приводит
-    # к сатурации CPU и таймаутам). Все наши to_thread.run_sync (растеризация,
-    # OCR, геометрия, docx→pdf) идут через этот лимитёр.
     try:
         to_thread.current_default_thread_limiter().total_tokens = HEAVY_WORK_CONCURRENCY
         logger.info("Heavy-work concurrency limited to %s", HEAVY_WORK_CONCURRENCY)
@@ -205,6 +205,30 @@ def _text_layer_is_usable(text: str) -> bool:
     return word_ratio >= 0.6
 
 
+def _text_layer_has_enough_content(all_pages_text: list[str]) -> bool:
+    """Проверяет, что текстового слоя ДОСТАТОЧНО для извлечения, а не несколько
+    символов на скан-страницах (типичный даташит-картинка с одним артикулом в
+    углу как текст, остальное — изображение). Без этой проверки система считает
+    «150TBS11 × 3» годным слоем и НЕ запускает OCR → LLM получает пустоту.
+
+    Критерий: уникального текста должно быть достаточно относительно числа
+    непустых страниц. Учитываем дублирование (на каждой странице один артикул)."""
+    non_empty = [t.strip() for t in all_pages_text if t and t.strip()]
+    if not non_empty:
+        return False
+    # Уникальные строки контента (убираем повторяющиеся колонтитулы/артикулы)
+    unique_lines: set[str] = set()
+    for page_text in non_empty:
+        for line in page_text.splitlines():
+            line = line.strip()
+            if len(line) >= 3:
+                unique_lines.add(line)
+    unique_chars = sum(len(line) for line in unique_lines)
+    page_count = len(all_pages_text) or 1
+    # Минимум ~60 уникальных символов на страницу — иначе это скан без текста.
+    return unique_chars >= 60 * page_count and unique_chars >= 120
+
+
 def _page_words_are_usable(pages: list["PdfPageIndex"]) -> bool:
     """Проверяет, что слова в текстовом индексе страниц — осмысленные, а не мусор.
 
@@ -220,13 +244,97 @@ def _page_words_are_usable(pages: list["PdfPageIndex"]) -> bool:
     return _text_layer_is_usable(sample)
 
 
-def _convert_pdf_to_structured_text(local_path: str) -> dict[str, Any]:
+def _page_words_are_enough(pages: list["PdfPageIndex"]) -> bool:
+    """Достаточно ли уникальных слов в индексе. Скан-PDF с одним артикулом-текстом
+    на странице (остальное — картинка) даёт пару слов на лист — этого мало для
+    привязки цитат, нужен OCR-индекс."""
+    unique_words = {
+        word.normalized
+        for page in pages
+        for word in page.words
+        if len(word.normalized) >= 2
+    }
+    page_count = len(pages) or 1
+    return len(unique_words) >= 8 * page_count and len(unique_words) >= 15
+
+
+def _extract_target_names_from_prompt(prompt: str) -> list[str] | None:
+    """Extracts target characteristic names from the prompt JSON list, if present."""
+    match = re.search(r"characteristic names to return.*?\n\s*\[", prompt, re.DOTALL | re.IGNORECASE)
+    if not match:
+        return None
+    start = prompt.index("[", match.start())
+    try:
+        names = json.loads(prompt[start:prompt.index("]", start) + 1])
+        if isinstance(names, list):
+            return [str(n) for n in names if isinstance(n, str) and n.strip()]
+    except (json.JSONDecodeError, ValueError):
+        pass
+    return None
+
+
+_RELEVANCE_KEYWORDS = re.compile(
+    r"характерист|параметр|показател|спецификац|specification|parameter|"
+    r"техничес|nominal|dimension|габарит|размер|масс[аы]|вес\b|"
+    r"мощност|напор|подач[аи]|производител|давлен|температур|"
+    r"частот|оборот|диаметр|длин[аы]|ширин[аы]|высот[аы]|"
+    r"марк[аи]|модел[ьи]|тип\b|обозначен",
+    re.IGNORECASE,
+)
+
+
+def _page_is_relevant(text: str, target_names: list[str] | None = None) -> bool:
+    if _RELEVANCE_KEYWORDS.search(text):
+        return True
+    if target_names:
+        text_lower = text.lower().replace("ё", "е")
+        for name in target_names:
+            name_words = [w for w in re.split(r"[\s:,]+", name.lower().replace("ё", "е")) if len(w) >= 3]
+            if name_words and sum(1 for w in name_words if w in text_lower) >= max(1, len(name_words) // 2):
+                return True
+    return False
+
+
+def _filter_relevant_pages(
+    all_pages_text: list[str],
+    target_names: list[str] | None = None,
+    max_chars: int = 30000,
+) -> tuple[list[tuple[int, str]], bool]:
+    """Returns ([(page_number, text), ...], was_filtered).
+    Keeps first page, last page, and any page with characteristic-related keywords.
+    Falls back to all pages if total text is small enough."""
+    total_len = sum(len(t) for t in all_pages_text)
+    if total_len <= max_chars:
+        return [(i + 1, t) for i, t in enumerate(all_pages_text) if t.strip()], False
+
+    relevant: list[tuple[int, str]] = []
+    for i, text in enumerate(all_pages_text):
+        if not text.strip():
+            continue
+        if i == 0 or i == len(all_pages_text) - 1:
+            relevant.append((i + 1, text))
+            continue
+        if _page_is_relevant(text, target_names):
+            relevant.append((i + 1, text))
+
+    if not relevant:
+        return [(i + 1, t) for i, t in enumerate(all_pages_text) if t.strip()], False
+
+    # If filtering cut too aggressively (< 3 pages), fall back to full text
+    if len(relevant) < 3 and len(all_pages_text) > 5:
+        return [(i + 1, t) for i, t in enumerate(all_pages_text) if t.strip()], False
+
+    return relevant, True
+
+
+def _convert_pdf_to_structured_text(
+    local_path: str,
+    target_names: list[str] | None = None,
+) -> dict[str, Any]:
     """Извлекает текст из PDF для передачи в LLM.
 
-    Сначала пробует извлечь текстовый слой через PyMuPDF.
-    Если PDF отсканированный (нет текстового слоя) ИЛИ текстовый слой «мусорный»
-    (битая кодировка шрифта) — применяет Tesseract OCR.
-    Возвращает структурированный текст с маркерами [PAGE N].
+    Для больших документов (>30K символов) фильтрует только страницы с
+    релевантным содержимым (таблицы характеристик), чтобы сократить prompt.
     """
     if not PYMUPDF_INSTALLED:
         return {"text": "", "page_count": 0, "ocr_applied": False, "error": "PyMuPDF not installed"}
@@ -236,7 +344,6 @@ def _convert_pdf_to_structured_text(local_path: str) -> dict[str, Any]:
     lines: list[str] = []
     ocr_applied = False
 
-    # Сначала пробуем обычный текстовый слой
     all_pages_text: list[str] = []
     for i in range(page_count):
         page = document.load_page(i)
@@ -244,18 +351,37 @@ def _convert_pdf_to_structured_text(local_path: str) -> dict[str, Any]:
         all_pages_text.append(text)
 
     combined_text = "\n".join(t for t in all_pages_text if t)
-    # Текстовый слой используем, только если он есть И осмысленный (не битая кодировка).
-    has_text = len(combined_text) > 20 and _text_layer_is_usable(combined_text)
+    has_enough = _text_layer_has_enough_content(all_pages_text)
+    has_text = (
+        len(combined_text) > 20
+        and _text_layer_is_usable(combined_text)
+        and has_enough
+    )
     if len(combined_text) > 20 and not has_text:
-        logger.info("PDF text layer looks garbled (broken font encoding) — falling back to OCR")
+        if not has_enough:
+            logger.info(
+                "PDF text layer too sparse (%d chars over %d pages — likely scanned) — falling back to OCR",
+                len(combined_text), page_count,
+            )
+        else:
+            logger.info("PDF text layer looks garbled (broken font encoding) — falling back to OCR")
 
+    pages_filtered = False
     if has_text:
-        for i, text in enumerate(all_pages_text):
-            if text:
-                lines.append(f"[PAGE {i + 1}]")
-                lines.append(text)
+        relevant_pages, pages_filtered = _filter_relevant_pages(
+            all_pages_text, target_names
+        )
+        if pages_filtered:
+            logger.info(
+                "PDF page filter: %d/%d pages selected (total %d chars → %d chars)",
+                len(relevant_pages), page_count,
+                sum(len(t) for t in all_pages_text),
+                sum(len(t) for _, t in relevant_pages),
+            )
+        for page_num, text in relevant_pages:
+            lines.append(f"[PAGE {page_num}]")
+            lines.append(text)
     else:
-        # Scanned PDF — пробуем Tesseract OCR
         ocr_available = False
         try:
             import pytesseract
@@ -286,12 +412,12 @@ def _convert_pdf_to_structured_text(local_path: str) -> dict[str, Any]:
 
     document.close()
     raw_text = "\n".join(lines).strip()
-    # Убираем суррогатные символы (могут возникать при OCR) — они невалидны в JSON/UTF-8
     clean_text = raw_text.encode("utf-8", errors="replace").decode("utf-8")
     return {
         "text": clean_text,
         "page_count": page_count,
         "ocr_applied": ocr_applied,
+        "pages_filtered": pages_filtered,
     }
 
 
@@ -430,6 +556,8 @@ def _raise_provider_http_error(response: httpx.Response, provider_name: str) -> 
 
 
 def _json_schema_response_format(name: str, schema: dict[str, Any]) -> dict[str, Any]:
+    if LLM_IS_YANDEX:
+        return {"type": "json_object"}
     return {
         "type": "json_schema",
         "json_schema": {
@@ -441,6 +569,8 @@ def _json_schema_response_format(name: str, schema: dict[str, Any]) -> dict[str,
 
 
 def _build_openrouter_provider_preferences(*, require_parameters: bool) -> dict[str, Any]:
+    if LLM_IS_YANDEX:
+        return {}
     provider: dict[str, Any] = {}
     if OPENROUTER_PROVIDER_ORDER:
         provider["order"] = OPENROUTER_PROVIDER_ORDER
@@ -651,6 +781,28 @@ def _collect_ancestor_context(ancestors: tuple[dict[str, Any], ...]) -> list[str
     return deduped[:8]
 
 
+def _build_synthetic_reference(label_context: list[str], value_context: list[str]) -> dict[str, Any] | None:
+    primary_value = next((v for v in value_context if v), "")
+    primary_label = " ".join(label_context[:2]).strip()
+    if not primary_value and not primary_label:
+        return None
+    value_is_ambiguous = primary_value and _is_ambiguous_short_candidate(
+        primary_value, _normalize_match_text(primary_value)
+    )
+    if value_is_ambiguous and primary_label:
+        quote_text = f"{primary_label} {primary_value}"
+        anchor_text = primary_label
+    else:
+        quote_text = primary_value or primary_label
+        anchor_text = quote_text
+    return {
+        "quote_text": quote_text,
+        "anchor_text": anchor_text,
+        "locator_text": anchor_text,
+        "synthetic_reference": True,
+    }
+
+
 def _inject_synthetic_references(node: Any) -> int:
     injected = 0
     if isinstance(node, dict):
@@ -664,16 +816,9 @@ def _inject_synthetic_references(node: Any) -> int:
             and not references
             and (label_context or value_context)
         ):
-            synthetic_text = next((value for value in value_context if value), "") or " ".join(label_context[:2]).strip()
-            if synthetic_text:
-                node["references"] = [
-                    {
-                        "quote_text": synthetic_text,
-                        "anchor_text": synthetic_text,
-                        "locator_text": synthetic_text,
-                        "synthetic_reference": True,
-                    }
-                ]
+            ref = _build_synthetic_reference(label_context, value_context)
+            if ref:
+                node["references"] = [ref]
                 injected += 1
         elif (
             not has_reference_key
@@ -682,16 +827,9 @@ def _inject_synthetic_references(node: Any) -> int:
             and any(key in node for key in ("name", "label", "title", "characteristic"))
             and any(key in node for key in ("value", "text", "answer", "content"))
         ):
-            synthetic_text = next((value for value in value_context if value), "") or " ".join(label_context[:2]).strip()
-            if synthetic_text:
-                node["references"] = [
-                    {
-                        "quote_text": synthetic_text,
-                        "anchor_text": synthetic_text,
-                        "locator_text": synthetic_text,
-                        "synthetic_reference": True,
-                    }
-                ]
+            ref = _build_synthetic_reference(label_context, value_context)
+            if ref:
+                node["references"] = [ref]
                 injected += 1
         for key, value in list(node.items()):
             if key == "references":
@@ -777,12 +915,15 @@ def _collect_reference_candidates(
 
     primary_label = " ".join(label_context[:2]).strip()
     primary_value = next((value for value in value_context if value), "")
+    value_is_ambiguous = primary_value and _is_ambiguous_short_candidate(
+        primary_value, _normalize_match_text(primary_value)
+    )
     if primary_label and primary_value:
         raw_candidates.append(
             {
                 "text": f"{primary_label} {primary_value}",
                 "kind": "label_plus_value",
-                "weight": 0.72,
+                "weight": 0.95 if value_is_ambiguous else 0.82,
                 "page_hint": page_hint,
             }
         )
@@ -791,7 +932,7 @@ def _collect_reference_candidates(
             {
                 "text": primary_value,
                 "kind": "value",
-                "weight": 0.8,
+                "weight": 0.5 if value_is_ambiguous else 0.8,
                 "page_hint": page_hint,
             }
         )
@@ -1023,6 +1164,31 @@ def _select_best_exact_rect(
     return best_rect, context_bonus
 
 
+def _bbox_is_compact(word_rects: list[Any], page_index: PdfPageIndex) -> bool:
+    """Rejects a union bbox that spans too large a portion of the page.
+    Typical table row is ~2-5% of page height and rarely the full width; a union
+    spanning >12% height OR >85% width means matched tokens are scattered across
+    multiple rows/columns → wrong match (e.g. value in one column, label in another)."""
+    if not word_rects:
+        return True
+    page_rect = _page_index_rect(page_index)
+    page_height = float(page_rect.height) if page_rect else 842.0  # A4 default
+    page_width = float(page_rect.width) if page_rect else 595.0
+    if page_height <= 0 or page_width <= 0:
+        return True
+    y_min = min(float(r.y0) for r in word_rects)
+    y_max = max(float(r.y1) for r in word_rects)
+    x_min = min(float(r.x0) for r in word_rects)
+    x_max = max(float(r.x1) for r in word_rects)
+    if (y_max - y_min) / page_height > 0.12:
+        return False
+    # Wide spans are only suspicious for multi-token matches: a single matched
+    # phrase is naturally narrow; a >85%-width union means tokens jumped columns.
+    if len(word_rects) >= 3 and (x_max - x_min) / page_width > 0.85:
+        return False
+    return True
+
+
 def _search_token_candidate(page_index: PdfPageIndex, candidate: str) -> tuple[Any | None, float]:
     tokens = _tokenize_match_text(candidate)
     if len(tokens) < 2 or not page_index.words:
@@ -1060,7 +1226,11 @@ def _search_token_candidate(page_index: PdfPageIndex, candidate: str) -> tuple[A
     if best_coverage < 0.55:
         return None, 0.0
 
-    rect = _union_rects([page_index.words[index].rect for index in best_indices])
+    word_rects = [page_index.words[index].rect for index in best_indices]
+    if not _bbox_is_compact(word_rects, page_index):
+        return None, 0.0
+
+    rect = _union_rects(word_rects)
     return rect, best_coverage
 
 
@@ -1111,7 +1281,11 @@ def _search_fuzzy_token_candidate(
     if best_ratio < 0.7 or len(best_indices) < 2:
         return None, 0.0
 
-    rect = _union_rects([page_index.words[index].rect for index in best_indices])
+    word_rects = [page_index.words[index].rect for index in best_indices]
+    if not _bbox_is_compact(word_rects, page_index):
+        return None, 0.0
+
+    rect = _union_rects(word_rects)
     return rect, best_ratio
 
 
@@ -1124,13 +1298,186 @@ def _token_overlap_ratio(a: str, b: str) -> float:
     return len(tokens_a & tokens_b) / len(tokens_a)
 
 
+_tables_cache: dict[int, Any] = {}
+
+
+def _get_page_tables(page_index: PdfPageIndex) -> Any:
+    page_id = id(page_index.page)
+    cached = _tables_cache.get(page_id)
+    if cached is not None:
+        return cached
+    try:
+        tables = page_index.page.find_tables()
+    except Exception:
+        tables = None
+    _tables_cache[page_id] = tables
+    return tables
+
+
+def _model_numeric_cores(text: str) -> list[str]:
+    """Числовое ядро типоразмера: '5Кс — 5х4 (КС 50-110/4)' → ['50-110/4','50-110'].
+    Паспорт пишет модель как '1Кс50-110' — полную строку из ТЗ search_for не найдёт,
+    а ядро '50-110' совпадает точно."""
+    norm = text.lower().replace("–", "-").replace("—", "-").replace("х", "x")
+    cores: list[str] = []
+    for m in re.findall(r"\d+(?:[-/x]\d+)+", norm):
+        if m not in cores:
+            cores.append(m)
+        base = m.split("/", 1)[0]
+        if "-" in base and base not in cores:
+            cores.append(base)
+    return cores
+
+
+def _model_term_rects(page_index: PdfPageIndex, context_terms: list[str]) -> list[Any]:
+    """Прямоугольники, где на странице встречается код модели из контекста —
+    по полной строке И по числовому ядру типоразмера (устойчиво к разным префиксам)."""
+    rects: list[Any] = []
+    search_terms: list[str] = []
+    for term in context_terms:
+        norm_term = _normalize_match_text(term)
+        if not norm_term or len(norm_term) < 4:
+            continue
+        search_terms.append(term)
+        # Числовое ядро (50-110) — паспорт обычно пишет модель именно так.
+        for core in _model_numeric_cores(term):
+            if len(core) >= 4 and core not in search_terms:
+                search_terms.append(core)
+    for term in search_terms:
+        rects.extend(_search_exact_candidate_rects(page_index.page, term))
+    return rects
+
+
+def _value_cells_in_table(page_index: PdfPageIndex, norm_value: str) -> list[Any]:
+    """Все ячейки таблиц, текст которых равен искомому значению."""
+    tables = _get_page_tables(page_index)
+    if not tables:
+        return []
+    cells: list[Any] = []
+    for table in tables.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                if cell is None:
+                    continue
+                try:
+                    cell_rect = fitz.Rect(cell) if not isinstance(cell, fitz.Rect) else cell
+                except Exception:
+                    continue
+                cell_text = page_index.page.get_textbox(cell_rect).strip()
+                if _normalize_match_text(cell_text) == norm_value:
+                    cells.append(cell_rect)
+    return cells
+
+
+def _search_value_in_model_table(
+    page_index: PdfPageIndex,
+    value_text: str,
+    context_terms: list[str],
+    param_label: str | None = None,
+) -> tuple[Any | None, float]:
+    """Находит ячейку со значением `value_text` в модельной таблице.
+
+    Поддерживает две раскладки:
+      • обычная (строка = модель): значение на той же ГОРИЗОНТАЛИ, что и код модели;
+      • транспонированная (столбец = модель, строка = параметр L/B/H): значение на
+        пересечении СТОЛБЦА модели (по X) и СТРОКИ параметра (по Y).
+
+    Anchor вида "Мощность, кВт 30" или "Типоразмер насоса 1Кс 50-110: L 1195" нельзя
+    искать целиком — заголовок и значение лежат в разных ячейках. Ищем ровно ячейку
+    значения, привязанную к строке/столбцу модели."""
+    norm_value = _normalize_match_text(value_text)
+    if not norm_value:
+        return None, 0.0
+    model_rects = _model_term_rects(page_index, context_terms)
+    if not model_rects:
+        return None, 0.0
+    value_cells = _value_cells_in_table(page_index, norm_value)
+    if not value_cells:
+        return None, 0.0
+
+    def _center(rect: Any) -> tuple[float, float]:
+        return ((float(rect.x0) + float(rect.x1)) / 2, (float(rect.y0) + float(rect.y1)) / 2)
+
+    def _layout_same_row() -> Any | None:
+        """Значение на ОДНОЙ СТРОКЕ с кодом модели (обычная раскладка)."""
+        cell, dist = None, float("inf")
+        for cell_rect in value_cells:
+            _, cy = _center(cell_rect)
+            for mr in model_rects:
+                y0, y1 = float(mr.y0) - 3, float(mr.y1) + 3
+                d = 0.0 if y0 <= cy <= y1 else min(abs(cy - y0), abs(cy - y1))
+                if d < dist:
+                    dist, cell = d, cell_rect
+        return cell if (cell is not None and dist <= 6) else None
+
+    def _layout_transposed() -> Any | None:
+        """Транспонированная: пересечение СТОЛБЦА модели (X) и СТРОКИ параметра (Y)."""
+        if not param_label:
+            return None
+        norm_label = _normalize_match_text(param_label)
+        # Метку строки (L/B/H) ищем в word index — search_for не находит одиночные буквы.
+        label_words = [w for w in page_index.words if w.normalized == norm_label]
+        if not label_words:
+            return None
+        leftmost_x = min(float(w.rect.x0) for w in label_words)
+        param_rects = [w.rect for w in label_words if float(w.rect.x0) <= leftmost_x + 30]
+        if not param_rects:
+            return None
+        model_xs = [(float(mr.x0) + float(mr.x1)) / 2 for mr in model_rects]
+        cell, best = None, float("inf")
+        for cell_rect in value_cells:
+            cx, cy = _center(cell_rect)
+            x_dist = min(abs(cx - mx) for mx in model_xs)
+            y_dist = min(
+                0.0 if (float(pr.y0) - 4) <= cy <= (float(pr.y1) + 4)
+                else min(abs(cy - float(pr.y0)), abs(cy - float(pr.y1)))
+                for pr in param_rects
+            )
+            if y_dist <= 6 and x_dist <= 40:
+                score = y_dist * 3 + x_dist
+                if score < best:
+                    best, cell = score, cell_rect
+        return cell
+
+    # Для габаритов (есть метка параметра L/B/H) сначала пробуем транспонированную
+    # раскладку — иначе значение случайно «прилипает» к заголовку модели по Y.
+    if param_label:
+        cell = _layout_transposed() or _layout_same_row()
+    else:
+        cell = _layout_same_row() or _layout_transposed()
+    if cell is not None:
+        return cell, 0.88
+    return None, 0.0
+
+
+_DIMENSION_LABELS = {
+    "длина": ["l", "длина", "дл"],
+    "ширина": ["b", "в", "ширина", "шир"],
+    "высота": ["h", "н", "высота", "выс"],
+}
+
+
+def _dimension_param_label(anchor_text: str) -> str | None:
+    """Из имени характеристики габарита возвращает короткую метку строки таблицы
+    (L/B/H), по которой ищется строка параметра в транспонированной таблице.
+    "Габаритные размеры: Длина" → 'L'."""
+    norm = _normalize_match_text(anchor_text)
+    for key, variants in _DIMENSION_LABELS.items():
+        if key in norm:
+            return variants[0].upper()
+    return None
+
+
 def _search_table_row_candidate(
     page_index: PdfPageIndex,
     anchor_text: str,
+    context_terms: list[str] | None = None,
+    value_text: str | None = None,
 ) -> tuple[Any | None, float]:
     """
     Searches for the table row or text line containing anchor_text.
     Strategy:
+      0. If value + model context given: find the value cell on the model's row.
       1. Use page.find_tables() — if anchor_text matches a cell, return bbox of the whole row.
       2. Otherwise find the text line whose words best overlap anchor tokens (Y-band grouping).
     """
@@ -1138,10 +1485,21 @@ def _search_table_row_candidate(
     if not normalized_anchor or len(normalized_anchor) < 2:
         return None, 0.0
 
+    # --- Step 0: model-keyed table — find the value cell on the model's row/column ---
+    if value_text and context_terms:
+        norm_val = _normalize_match_text(value_text)
+        if norm_val and _is_ambiguous_short_candidate(value_text, norm_val):
+            param_label = _dimension_param_label(anchor_text)
+            rect, conf = _search_value_in_model_table(
+                page_index, value_text, context_terms, param_label=param_label
+            )
+            if rect is not None:
+                return rect, conf
+
     # --- Step 1: Search in tables ---
     try:
-        tables = page_index.page.find_tables()
-        for table in tables.tables:
+        tables = _get_page_tables(page_index)
+        for table in (tables.tables if tables else []):
             for row in table.rows:
                 for cell in row.cells:
                     if cell is None:
@@ -1159,14 +1517,27 @@ def _search_table_row_candidate(
                         or cell_normalized in normalized_anchor
                         or _token_overlap_ratio(normalized_anchor, cell_normalized) >= 0.6
                     ):
-                        row_rect = _union_rects([
+                        row_cells = [
                             fitz.Rect(c) if not isinstance(c, fitz.Rect) else c
                             for c in row.cells
                             if c is not None
-                        ])
-                        if row_rect and not row_rect.is_empty:
-                            overlap = _token_overlap_ratio(normalized_anchor, cell_normalized)
-                            return row_rect, max(0.7, overlap)
+                        ]
+                        row_rect = _union_rects(row_cells)
+                        if not row_rect or row_rect.is_empty:
+                            continue
+                        page_rect = _page_index_rect(page_index)
+                        ph = float(page_rect.height) if page_rect else 842.0
+                        pw = float(page_rect.width) if page_rect else 595.0
+                        # Reject oversized rows (merged cells across visual rows)
+                        if ph > 0 and float(row_rect.height) / ph > 0.12:
+                            continue
+                        overlap = _token_overlap_ratio(normalized_anchor, cell_normalized)
+                        # For very wide rows (multi-column tables like "Размеры в мм"),
+                        # the whole-row highlight is misleading — narrow to the matched
+                        # cell so the user sees the actual value, not the full table width.
+                        if pw > 0 and float(row_rect.width) / pw > 0.6:
+                            return cell_rect, max(0.7, overlap)
+                        return row_rect, max(0.7, overlap)
     except Exception as exc:
         logger.debug("find_tables failed on page %d: %s", page_index.page_number, exc)
 
@@ -1223,8 +1594,8 @@ def _is_ambiguous_short_candidate(text: str, normalized: str) -> bool:
 def _candidate_rank(candidate: dict[str, Any], has_descriptive_candidate: bool = False) -> float:
     base = {
         "quote_text": 1000.0,
-        "value": 950.0,
-        "label_plus_value": 850.0,
+        "label_plus_value": 950.0,
+        "value": 900.0,
         "raw_reference": 800.0,
         "locator_text": 550.0,
         "text": 520.0,
@@ -1232,12 +1603,15 @@ def _candidate_rank(candidate: dict[str, Any], has_descriptive_candidate: bool =
         "label": 250.0,
     }.get(str(candidate.get("kind") or ""), 300.0)
 
-    # Lower rank for short/numeric quote_text or value when a descriptive candidate exists.
-    if has_descriptive_candidate and candidate.get("kind") in {"quote_text", "value"}:
-        text = str(candidate.get("text") or "")
-        normalized = str(candidate.get("normalized") or _normalize_match_text(text))
+    text = str(candidate.get("text") or "")
+    normalized = str(candidate.get("normalized") or _normalize_match_text(text))
+
+    # Ambiguous short/numeric candidates are unreliable — they match everywhere
+    # in multi-page documents. Demote them heavily so that descriptive candidates
+    # (label_plus_value, anchor_text) win.
+    if candidate.get("kind") in {"quote_text", "value"}:
         if _is_ambiguous_short_candidate(text, normalized):
-            return 200.0
+            return 150.0 if has_descriptive_candidate else 200.0
     return base
 
 
@@ -1247,6 +1621,20 @@ def _is_generic_table_anchor(candidate: dict[str, Any]) -> bool:
         return False
     normalized = str(candidate.get("normalized") or _normalize_match_text(str(candidate.get("text") or "")))
     return bool(re.fullmatch(r"(таблица|table)\s*\d*", normalized, flags=re.IGNORECASE))
+
+
+def _page_has_context(page_index: PdfPageIndex, context_terms: list[str]) -> bool:
+    """Checks whether any of the context terms appear on the given page."""
+    if not context_terms or not page_index.words:
+        return False
+    page_text_set = {w.normalized for w in page_index.words}
+    for term in context_terms:
+        term_tokens = _tokenize_match_text(term)
+        if not term_tokens:
+            continue
+        if sum(1 for t in term_tokens if t in page_text_set) >= max(1, len(term_tokens) // 2):
+            return True
+    return False
 
 
 def _find_reference_location(
@@ -1260,20 +1648,14 @@ def _find_reference_location(
         candidate.get("kind") in {"quote_text", "value", "label_plus_value", "raw_reference"}
         for candidate in candidates
     )
-    # Whether a descriptive (long) candidate exists — used to penalise short/numeric ones
     has_descriptive_candidate = any(
         c.get("kind") in {"anchor_text", "locator_text", "label_plus_value"}
         and len(str(c.get("normalized") or _normalize_match_text(str(c.get("text") or "")))) > 6
         for c in candidates
     )
 
-    for candidate in candidates:
-        if has_specific_candidate and _is_generic_table_anchor(candidate):
-            continue
-        candidate_text = candidate["text"]
-        candidate_weight = float(candidate.get("weight", 0.5))
-        page_hint = _safe_page_number(candidate.get("page_hint"))
-        ordered_pages = sorted(
+    def _sorted_pages(page_hint: int | None, nearby_only: bool = False) -> list[PdfPageIndex]:
+        ordered = sorted(
             pages,
             key=lambda page_index: (
                 0 if page_hint and page_index.page_number == page_hint else 1,
@@ -1281,108 +1663,179 @@ def _find_reference_location(
                 page_index.page_number,
             ),
         )
-        for page_index in ordered_pages:
-            rects = _search_exact_candidate_rects(page_index.page, candidate_text)
-            rect, context_bonus = _select_best_exact_rect(rects, page_index, context_terms)
-            if not rect:
+        if nearby_only and page_hint:
+            return [p for p in ordered if abs(p.page_number - page_hint) <= 3]
+        return ordered
+
+    def _ambiguity_penalty(candidate: dict[str, Any], page_index: PdfPageIndex) -> float:
+        """Heavy penalty for ambiguous short candidates that land on a page
+        where none of the context terms (characteristic name, product name) appear.
+        This prevents "280" from matching on page 58 when the characteristic
+        "Масса насоса" is only on page 6."""
+        text = str(candidate.get("text") or "")
+        normalized = str(candidate.get("normalized") or _normalize_match_text(text))
+        if not _is_ambiguous_short_candidate(text, normalized):
+            return 0.0
+        if not context_terms:
+            return 0.0
+        if _page_has_context(page_index, context_terms):
+            return 0.0
+        return -500.0
+
+    any_has_page_hint = any(_safe_page_number(c.get("page_hint")) for c in candidates)
+    large_doc = len(pages) > 10
+
+    # --- Pass 0: модель-aware поиск ячейки значения для ГАБАРИТОВ ---
+    # Габаритные quote вида "Типоразмер насоса 1Кс 50-110: L 1195" иначе ловятся
+    # token-поиском за заголовок "Типоразмер насоса". Если есть модель и метка
+    # габарита (L/B/H), приоритетно ищем ячейку значения в строке параметра ×
+    # столбце модели — это даёт точную ячейку, а не заголовок.
+    value_cand = next((c for c in candidates if c.get("kind") == "value"), None)
+    anchor_cand = next(
+        (c for c in candidates if c.get("kind") in {"anchor_text", "label", "label_plus_value"}),
+        None,
+    )
+    if value_cand and context_terms:
+        param_label = None
+        for c in candidates:
+            lbl = _dimension_param_label(str(c.get("text") or ""))
+            if lbl:
+                param_label = lbl
+                break
+        if param_label:
+            page_hint = _safe_page_number(value_cand.get("page_hint"))
+            for page_index in _sorted_pages(page_hint, nearby_only=bool(page_hint and large_doc)):
+                rect, conf = _search_value_in_model_table(
+                    page_index, value_cand["text"], context_terms, param_label=param_label
+                )
+                if rect is not None:
+                    # Высокий score, чтобы token-поиск не перебил точную ячейку
+                    # заголовком "Типоразмер насоса".
+                    best_match = {
+                        "page": page_index.page_number,
+                        "bbox": _rect_to_bbox(rect, _page_index_rect(page_index)),
+                        "score": 1300.0 + conf * 100,
+                        "locator_strategy": "table_cell",
+                        "matched_text": value_cand["text"],
+                    }
+                    break
+
+    def _do_exact_pass(page_list_fn):
+        nonlocal best_match
+        for candidate in candidates:
+            if has_specific_candidate and _is_generic_table_anchor(candidate):
                 continue
-            page_bonus = 18.0 if page_hint and page_index.page_number == page_hint else 0.0
-            score = (
-                _candidate_rank(candidate, has_descriptive_candidate=has_descriptive_candidate)
-                + len(candidate.get("normalized", _normalize_match_text(candidate_text))) * candidate_weight
-                + page_bonus
-                + context_bonus
-            )
-            if not best_match or score > best_match["score"]:
-                best_match = {
-                    "page": page_index.page_number,
-                    "bbox": _rect_to_bbox(rect, _page_index_rect(page_index)),
-                    "score": score,
-                    "locator_strategy": "pymupdf_exact",
-                    "matched_text": candidate_text,
-                }
+            candidate_text = candidate["text"]
+            candidate_weight = float(candidate.get("weight", 0.5))
+            page_hint = _safe_page_number(candidate.get("page_hint"))
+            for page_index in page_list_fn(page_hint):
+                rects = _search_exact_candidate_rects(page_index.page, candidate_text)
+                rect, context_bonus = _select_best_exact_rect(rects, page_index, context_terms)
+                if not rect:
+                    continue
+                page_bonus = 18.0 if page_hint and page_index.page_number == page_hint else 0.0
+                score = (
+                    _candidate_rank(candidate, has_descriptive_candidate=has_descriptive_candidate)
+                    + len(candidate.get("normalized", _normalize_match_text(candidate_text))) * candidate_weight
+                    + page_bonus
+                    + context_bonus
+                    + _ambiguity_penalty(candidate, page_index)
+                )
+                if not best_match or score > best_match["score"]:
+                    best_match = {
+                        "page": page_index.page_number,
+                        "bbox": _rect_to_bbox(rect, _page_index_rect(page_index)),
+                        "score": score,
+                        "locator_strategy": "pymupdf_exact",
+                        "matched_text": candidate_text,
+                    }
 
-    if best_match:
-        return best_match
+    def _do_token_pass(page_list_fn):
+        nonlocal best_match
+        for candidate in candidates:
+            if has_specific_candidate and _is_generic_table_anchor(candidate):
+                continue
+            candidate_text = candidate["text"]
+            candidate_weight = float(candidate.get("weight", 0.5))
+            page_hint = _safe_page_number(candidate.get("page_hint"))
+            for page_index in page_list_fn(page_hint):
+                rect, coverage = _search_token_candidate(page_index, candidate_text)
+                if not rect:
+                    continue
+                page_bonus = 12.0 if page_hint and page_index.page_number == page_hint else 0.0
+                score = (
+                    _candidate_rank(candidate, has_descriptive_candidate=has_descriptive_candidate)
+                    + coverage * 100 * candidate_weight
+                    + min(len(candidate_text), 120) / 10
+                    + page_bonus
+                    + _ambiguity_penalty(candidate, page_index)
+                )
+                if not best_match or score > best_match["score"]:
+                    best_match = {
+                        "page": page_index.page_number,
+                        "bbox": _rect_to_bbox(rect, _page_index_rect(page_index)),
+                        "score": score,
+                        "locator_strategy": "pymupdf_tokens",
+                        "matched_text": candidate_text,
+                    }
 
-    for candidate in candidates:
-        if has_specific_candidate and _is_generic_table_anchor(candidate):
-            continue
-        candidate_text = candidate["text"]
-        candidate_weight = float(candidate.get("weight", 0.5))
-        page_hint = _safe_page_number(candidate.get("page_hint"))
-        ordered_pages = sorted(
-            pages,
-            key=lambda page_index: (
-                0 if page_hint and page_index.page_number == page_hint else 1,
-                abs(page_index.page_number - page_hint) if page_hint else 0,
-                page_index.page_number,
-            ),
+    # --- Pass 1+2: exact + token search ---
+    # For large docs with page hints: try nearby pages first, expand only if needed
+    if large_doc and any_has_page_hint:
+        _do_exact_pass(lambda hint: _sorted_pages(hint, nearby_only=True))
+        _do_token_pass(lambda hint: _sorted_pages(hint, nearby_only=True))
+        if not best_match or best_match["score"] <= 500:
+            _do_exact_pass(lambda hint: _sorted_pages(hint))
+            _do_token_pass(lambda hint: _sorted_pages(hint))
+    else:
+        _do_exact_pass(lambda hint: _sorted_pages(hint))
+        _do_token_pass(lambda hint: _sorted_pages(hint))
+
+    # --- Pass 3: table row / free-text line search ---
+    # find_tables() is expensive on large PDFs — skip if passes 1-2 found a confident match
+    if not best_match or best_match["score"] <= 500:
+        anchor_candidates = [
+            c for c in candidates
+            if c.get("kind") in {"anchor_text", "locator_text", "label", "label_plus_value"}
+            and len(c.get("normalized", "")) >= 3
+        ]
+        # Значение характеристики (для модельных таблиц: ищем ячейку значения на
+        # строке нужной модели, а не заголовок в чужой колонке).
+        value_candidate = next(
+            (c["text"] for c in candidates if c.get("kind") == "value"), None
         )
-        for page_index in ordered_pages:
-            rect, coverage = _search_token_candidate(page_index, candidate_text)
-            if not rect:
+        for candidate in anchor_candidates:
+            if has_specific_candidate and _is_generic_table_anchor(candidate):
                 continue
-            page_bonus = 12.0 if page_hint and page_index.page_number == page_hint else 0.0
-            score = (
-                _candidate_rank(candidate, has_descriptive_candidate=has_descriptive_candidate)
-                + coverage * 100 * candidate_weight
-                + min(len(candidate_text), 120) / 10
-                + page_bonus
-            )
-            if not best_match or score > best_match["score"]:
-                best_match = {
-                    "page": page_index.page_number,
-                    "bbox": _rect_to_bbox(rect, _page_index_rect(page_index)),
-                    "score": score,
-                    "locator_strategy": "pymupdf_tokens",
-                    "matched_text": candidate_text,
-                }
-    # --- Third pass: table row / free-text line search ---
-    anchor_candidates = [
-        c for c in candidates
-        if c.get("kind") in {"anchor_text", "locator_text", "label", "label_plus_value"}
-        and len(c.get("normalized", "")) >= 3
-    ]
-    for candidate in anchor_candidates:
-        if has_specific_candidate and _is_generic_table_anchor(candidate):
-            continue
-        candidate_text = candidate["text"]
-        candidate_weight = float(candidate.get("weight", 0.5))
-        page_hint = _safe_page_number(candidate.get("page_hint"))
-        ordered_pages = sorted(
-            pages,
-            key=lambda page_index: (
-                0 if page_hint and page_index.page_number == page_hint else 1,
-                abs(page_index.page_number - page_hint) if page_hint else 0,
-                page_index.page_number,
-            ),
-        )
-        for page_index in ordered_pages:
-            rect, overlap = _search_table_row_candidate(page_index, candidate_text)
-            if not rect:
-                continue
-            page_bonus = 10.0 if page_hint and page_index.page_number == page_hint else 0.0
-            score = (
-                _candidate_rank(candidate, has_descriptive_candidate=False)
-                + overlap * 80 * candidate_weight
-                + min(len(candidate_text), 120) / 10
-                + page_bonus
-            )
-            if not best_match or score > best_match["score"]:
-                best_match = {
-                    "page": page_index.page_number,
-                    "bbox": _rect_to_bbox(rect, _page_index_rect(page_index)),
-                    "score": score,
-                    "locator_strategy": "table_row",
-                    "matched_text": candidate_text,
-                }
+            candidate_text = candidate["text"]
+            candidate_weight = float(candidate.get("weight", 0.5))
+            page_hint = _safe_page_number(candidate.get("page_hint"))
+            for page_index in _sorted_pages(page_hint):
+                rect, overlap = _search_table_row_candidate(
+                    page_index,
+                    candidate_text,
+                    context_terms=context_terms,
+                    value_text=value_candidate,
+                )
+                if not rect:
+                    continue
+                page_bonus = 10.0 if page_hint and page_index.page_number == page_hint else 0.0
+                score = (
+                    _candidate_rank(candidate, has_descriptive_candidate=False)
+                    + overlap * 80 * candidate_weight
+                    + min(len(candidate_text), 120) / 10
+                    + page_bonus
+                )
+                if not best_match or score > best_match["score"]:
+                    best_match = {
+                        "page": page_index.page_number,
+                        "bbox": _rect_to_bbox(rect, _page_index_rect(page_index)),
+                        "score": score,
+                        "locator_strategy": "table_row",
+                        "matched_text": candidate_text,
+                    }
 
-    # --- Fourth pass: OCR-устойчивый нечёткий поиск ---
-    # Срабатывает, когда точный/последовательный/табличный поиск ничего не нашли —
-    # типичная ситуация для сканов, где OCR искажает символы. Берём только
-    # содержательные кандидаты (цитата/значение), чтобы не цепляться за общий
-    # заголовок вроде "Технические характеристики".
+    # --- Pass 4: OCR-robust fuzzy search ---
     if best_match is None:
         fuzzy_candidates = [
             c
@@ -1390,10 +1843,6 @@ def _find_reference_location(
             if c.get("kind") in {"quote_text", "value", "label_plus_value", "raw_reference"}
             and not _is_generic_table_anchor(c)
         ]
-        # Считаем нечёткое совпадение цитаты по каждой странице, затем выбираем
-        # лучшую — НО только если она заметно опережает остальные. Если на разных
-        # страницах совпадение почти одинаковое (распознались общие слова), позиция
-        # неоднозначна, и угадывать страницу нельзя — пропускаем (вернём None).
         for candidate in fuzzy_candidates:
             candidate_text = candidate["text"]
             page_ratios: list[tuple[float, Any, Any]] = []
@@ -1406,7 +1855,6 @@ def _find_reference_location(
             page_ratios.sort(key=lambda item: item[0], reverse=True)
             top_ratio, top_rect, top_page_index = page_ratios[0]
             runner_up = page_ratios[1][0] if len(page_ratios) > 1 else 0.0
-            # Неоднозначно: лучшая страница не опережает следующую хотя бы на 0.2.
             if top_ratio - runner_up < 0.2:
                 continue
             candidate_weight = float(candidate.get("weight", 0.5))
@@ -1486,6 +1934,7 @@ def _enrich_references_with_pdf_geometry(
         return metadata
 
     document = None
+    _tables_cache.clear()
     try:
         document, pages = _build_pdf_page_index(local_path)
         metadata["page_count"] = document.page_count
@@ -1493,10 +1942,16 @@ def _enrich_references_with_pdf_geometry(
         # кодировкой шрифта слова «есть», но это мусор — по нему цитаты не
         # находятся (0 координат, клик не работает). Тогда падаем на OCR.
         has_words = any(page.words for page in pages)
-        text_layer_usable = has_words and _page_words_are_usable(pages)
+        # Достаточно ли слов: скан с парой слов на странице («осмысленных», но
+        # пустых по сути) тоже надо отправить на OCR, иначе цитаты не находятся.
+        enough_words = _page_words_are_enough(pages)
+        text_layer_usable = has_words and _page_words_are_usable(pages) and enough_words
         if has_words and not text_layer_usable:
-            metadata["garbled_text_layer"] = True
-            logger.info("Geometry: text layer garbled — falling back to OCR index")
+            if not enough_words:
+                logger.info("Geometry: text layer too sparse (scanned) — falling back to OCR index")
+            else:
+                metadata["garbled_text_layer"] = True
+                logger.info("Geometry: text layer garbled — falling back to OCR index")
         metadata["searchable_pdf"] = text_layer_usable
         if not metadata["searchable_pdf"]:
             # Attempt OCR fallback for scanned PDFs OR garbled text layer
@@ -1558,7 +2013,7 @@ def _enrich_references_with_pdf_geometry(
                 if not candidates:
                     continue
 
-                match = _find_reference_location(pages, candidates, ancestor_context)
+                match = _find_reference_location(pages, candidates, ancestor_context + label_context)
                 if not match:
                     # Геометрия не смогла привязать цитату к месту в PDF.
                     # Для сканов (OCR) номер страницы от LLM — это догадка
@@ -1660,14 +2115,29 @@ async def _chat_completion_json(
     repair_model: Optional[str] = None,
 ) -> tuple[dict[str, Any], dict[str, Any], bool]:
     used_fallback = False
+    model_key = str(payload.get("model") or "")
+    skip_strict = model_key and _strict_schema_supported.get(model_key) is False
+
+    actual_payload = payload
+    if skip_strict and "response_format" in payload:
+        actual_payload = dict(payload)
+        actual_payload.pop("response_format", None)
+        if isinstance(actual_payload.get("provider"), dict):
+            provider = dict(actual_payload["provider"])
+            provider.pop("require_parameters", None)
+            actual_payload["provider"] = provider if provider else actual_payload.pop("provider", None)
+        used_fallback = True
+
     async with httpx.AsyncClient(
         timeout=REMOTE_API_TIMEOUT_SECONDS,
         trust_env=False,
     ) as client:
-        response = await client.post(endpoint, json=payload, headers=headers)
+        response = await client.post(endpoint, json=actual_payload, headers=headers)
 
-        if response.status_code >= 400 and "response_format" in payload:
-            fallback_payload = dict(payload)
+        if response.status_code >= 400 and "response_format" in actual_payload:
+            if model_key:
+                _strict_schema_supported[model_key] = False
+            fallback_payload = dict(actual_payload)
             fallback_payload.pop("response_format", None)
             if isinstance(fallback_payload.get("provider"), dict):
                 provider = dict(fallback_payload["provider"])
@@ -1684,6 +2154,8 @@ async def _chat_completion_json(
         else:
             if response.status_code >= 400:
                 _raise_provider_http_error(response, provider_name)
+            if model_key and not skip_strict and "response_format" in payload:
+                _strict_schema_supported[model_key] = True
             data = response.json()
 
     if not isinstance(data, dict):
@@ -2202,8 +2674,9 @@ async def _extract_via_llamaparse(payload: ExtractionRequest) -> dict[str, Any]:
         payload_json["provider"] = provider_preferences
 
     headers = _build_openai_headers(OPENROUTER_API_KEY)
-    headers["HTTP-Referer"] = OPENROUTER_SITE_URL or "http://localhost:8005"
-    headers["X-Title"] = OPENROUTER_APP_NAME or "extraction-service"
+    if not LLM_IS_YANDEX:
+        headers["HTTP-Referer"] = OPENROUTER_SITE_URL or "http://localhost:8005"
+        headers["X-Title"] = OPENROUTER_APP_NAME or "extraction-service"
 
     try:
         extracted_data, provider_response, used_fallback = await _chat_completion_json(
@@ -2336,9 +2809,13 @@ async def _extract_via_openrouter(payload: ExtractionRequest) -> dict[str, Any]:
         # Для PDF: сначала пробуем извлечь текст локально (searchable или OCR).
         # Если текст получен — отправляем как текст (надёжнее, чем file-parser плагин).
         # Если текст пустой — падаем обратно на file-parser (нативный путь OpenRouter).
+        # Для Yandex: file-parser недоступен, поэтому всегда используем текстовый путь.
         try:
             pdf_conversion_metadata = await to_thread.run_sync(
-                lambda: _convert_pdf_to_structured_text(downloaded_file.local_path)
+                lambda: _convert_pdf_to_structured_text(
+                    downloaded_file.local_path,
+                    target_names=_extract_target_names_from_prompt(prompt),
+                )
             )
             logger.info(
                 "PDF text extraction: ocr_applied=%s text_len=%d",
@@ -2360,6 +2837,18 @@ async def _extract_via_openrouter(payload: ExtractionRequest) -> dict[str, Any]:
         if extracted_text.strip():
             use_text_path = True
             document_text = extracted_text
+        elif LLM_IS_YANDEX:
+            # Yandex doesn't support file content parts — if text extraction yielded nothing,
+            # we still can't send the raw file; raise an informative error.
+            raise HTTPException(
+                status_code=422,
+                detail="Yandex AI: PDF has no extractable text layer and file upload is not supported.",
+            )
+    elif LLM_IS_YANDEX and _looks_like_image(downloaded_file.filename, downloaded_file.content_type):
+        raise HTTPException(
+            status_code=422,
+            detail="Yandex AI: image extraction is not supported (no vision API).",
+        )
 
     logger.info("Extraction path: use_text_path=%s document_text_len=%d", use_text_path, len(document_text))
 
@@ -2386,8 +2875,8 @@ async def _extract_via_openrouter(payload: ExtractionRequest) -> dict[str, Any]:
     provider_preferences = _build_openrouter_provider_preferences(require_parameters=True)
     if provider_preferences:
         payload_json["provider"] = provider_preferences
-    # file-parser плагин добавляем только если не используем text-путь
-    if not use_text_path and not _looks_like_image(downloaded_file.filename, downloaded_file.content_type):
+    # file-parser плагин — только для OpenRouter, когда не используем text-путь
+    if not LLM_IS_YANDEX and not use_text_path and not _looks_like_image(downloaded_file.filename, downloaded_file.content_type):
         payload_json["plugins"] = [
             {
                 "id": "file-parser",
@@ -2396,8 +2885,9 @@ async def _extract_via_openrouter(payload: ExtractionRequest) -> dict[str, Any]:
         ]
 
     headers = _build_openai_headers(OPENROUTER_API_KEY)
-    headers["HTTP-Referer"] = OPENROUTER_SITE_URL or "http://localhost:8005"
-    headers["X-Title"] = OPENROUTER_APP_NAME or "extraction-service"
+    if not LLM_IS_YANDEX:
+        headers["HTTP-Referer"] = OPENROUTER_SITE_URL or "http://localhost:8005"
+        headers["X-Title"] = OPENROUTER_APP_NAME or "extraction-service"
 
     started_at = time.monotonic()
     geometry_metadata: dict[str, Any] = {
@@ -2535,7 +3025,13 @@ def _classify_pdf_for_preview(local_path: str) -> dict[str, bool]:
       - non_embedded_fonts: есть шрифты, которые PDF.js не умеет рендерить.
     Чистый PDF (только web-safe шрифты, без поворота, читаемый текст) —
     отдаём оригинал как есть (быстро, постранично, текст выделяется)."""
-    info = {"rotated": False, "garbled": False, "non_embedded_fonts": False, "needs_rasterization": False}
+    info = {
+        "rotated": False,
+        "garbled": False,
+        "non_embedded_fonts": False,
+        "scan_rotated": False,
+        "needs_rasterization": False,
+    }
     # Шрифты, которые PDF.js умеет рендерить сам без растеризации:
     # стандартные 14 PDF-шрифтов + распространённые web-safe (latin-only).
     # Любой другой встроенный шрифт (особенно кириллические TrueType вроде
@@ -2550,11 +3046,17 @@ def _classify_pdf_for_preview(local_path: str) -> dict[str, bool]:
         try:
             pages_to_check = min(doc.page_count, 15)
             text_parts: list[str] = []
+            scan_pages: list[int] = []
             for i in range(pages_to_check):
                 page = doc.load_page(i)
                 if page.rotation:
                     info["rotated"] = True
-                text_parts.append(page.get_text("text", sort=True))
+                page_text = page.get_text("text", sort=True)
+                text_parts.append(page_text)
+                # Страница-скан (нет текстового слоя) — кандидат на проверку
+                # ориентации содержимого: PDF /Rotate=0, но картинка может быть боком.
+                if len(page_text.strip()) < 10:
+                    scan_pages.append(i)
                 for font in doc.get_page_fonts(i):
                     # font = (xref, ext, type, basefont, name, encoding)
                     ext = (font[1] or "").strip().lower()
@@ -2568,6 +3070,13 @@ def _classify_pdf_for_preview(local_path: str) -> dict[str, bool]:
             combined = "\n".join(t for t in text_parts if t)
             if len(combined) > 50 and not _text_layer_is_usable(combined):
                 info["garbled"] = True
+            # Скан-страницы без текстового слоя: проверяем ориентацию содержимого
+            # через Tesseract OSD. Если контент повёрнут (текст идёт боком) — нужна
+            # растеризация с авто-поворотом, иначе превью покажет документ криво и
+            # подсветка (привязанная к выпрямленному OCR-индексу) не совпадёт.
+            if scan_pages and not info["rotated"]:
+                if _scan_pages_are_rotated(doc, scan_pages[:3]):
+                    info["scan_rotated"] = True
         finally:
             doc.close()
     except Exception:
@@ -2576,9 +3085,40 @@ def _classify_pdf_for_preview(local_path: str) -> dict[str, bool]:
         return info
 
     info["needs_rasterization"] = (
-        info["rotated"] or info["garbled"] or info["non_embedded_fonts"]
+        info["rotated"]
+        or info["garbled"]
+        or info["non_embedded_fonts"]
+        or info["scan_rotated"]
     )
     return info
+
+
+def _scan_pages_are_rotated(doc: Any, page_indices: list[int]) -> bool:
+    """Проверяет через Tesseract OSD, повёрнуто ли содержимое скан-страниц.
+    Возвращает True, если хотя бы одна страница уверенно распознана повёрнутой
+    (rotate != 0). Используется для превью: PDF /Rotate=0, но картинка боком."""
+    try:
+        import pytesseract
+        from PIL import Image
+        import io
+    except Exception:
+        return False
+    rotated_votes = 0
+    checked = 0
+    for i in page_indices:
+        try:
+            page = doc.load_page(i)
+            pix = page.get_pixmap(matrix=fitz.Matrix(150 / 72, 150 / 72), alpha=False)
+            img = Image.open(io.BytesIO(pix.tobytes("png")))
+            osd = pytesseract.image_to_osd(img, output_type=pytesseract.Output.DICT)
+            rotate = int(osd.get("rotate", 0) or 0)
+            conf = float(osd.get("orientation_conf", 0) or 0)
+            checked += 1
+            if rotate % 360 != 0 and conf >= 2.0:
+                rotated_votes += 1
+        except Exception:
+            continue
+    return checked > 0 and rotated_votes > 0
 
 
 def _pdf_needs_rasterization(local_path: str) -> bool:
