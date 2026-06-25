@@ -1035,6 +1035,10 @@ def _build_pdf_page_index_ocr(local_path: str) -> tuple[Any, list[PdfPageIndex]]
     from PIL import Image
     import io
 
+    # DPI=150 даёт самые стабильные заголовки столбцов моделей ('50-110' и т.п.),
+    # что критично для привязки ячеек таблиц к нужной модели. Более высокий DPI
+    # иногда лучше читает плотные строки значений, но дробит/теряет заголовки
+    # моделей — а без якоря модели вся табличная привязка рушится.
     DPI = 150
     document = fitz.open(local_path)
     pages: list[PdfPageIndex] = []
@@ -1363,13 +1367,44 @@ def _model_rects_from_words(page_index: PdfPageIndex, context_terms: list[str]) 
                 cores.append(norm_core)
     if not cores:
         return []
+
     rects: list[Any] = []
+    matched_y: list[float] = []
     for word in page_index.words:
         wn = word.normalized
         for core in cores:
             if core in wn:
                 rects.append(word.rect)
+                matched_y.append(float(word.rect.y0))
                 break
+    if rects:
+        return rects
+
+    # OCR мог раздробить заголовок '50-110' на соседние слова '50' и '110'
+    # (или '50-' + '110'). Восстанавливаем: для каждого ядра вида 'A-B' ищем
+    # слово, начинающееся на A, и рядом (та же строка, правее, близко по X)
+    # слово, заканчивающееся на B. Прямоугольник — объединение двух слов.
+    for core in cores:
+        parts = core.split("-")
+        if len(parts) != 2 or not (parts[0].isdigit() and parts[1].isdigit()):
+            continue
+        a, b = parts[0], parts[1]
+        a_words = [w for w in page_index.words if w.normalized.rstrip("-") == a or w.normalized == a]
+        b_words = [w for w in page_index.words if w.normalized == b or w.normalized.lstrip("-") == b]
+        for aw in a_words:
+            ay = (float(aw.rect.y0) + float(aw.rect.y1)) / 2
+            ah = float(aw.rect.y1) - float(aw.rect.y0)
+            for bw in b_words:
+                by = (float(bw.rect.y0) + float(bw.rect.y1)) / 2
+                same_row = abs(ay - by) <= max(ah, 6.0)
+                right_after = 0 <= (float(bw.rect.x0) - float(aw.rect.x1)) <= max(ah * 2, 20.0)
+                if same_row and right_after:
+                    rects.append(fitz.Rect(
+                        min(float(aw.rect.x0), float(bw.rect.x0)),
+                        min(float(aw.rect.y0), float(bw.rect.y0)),
+                        max(float(aw.rect.x1), float(bw.rect.x1)),
+                        max(float(aw.rect.y1), float(bw.rect.y1)),
+                    ))
     return rects
 
 
@@ -1496,7 +1531,10 @@ def _search_value_in_model_table(
         что устраняет грубую ошибку (значение из чужой модели). Уверенность ниже."""
         model_xs = [(float(mr.x0) + float(mr.x1)) / 2 for mr in model_rects]
         header_bottom = max(float(mr.y1) for mr in model_rects)
-        x_tol = max(model_h * 4, 60.0)
+        # Узкий допуск по X — иначе залезаем в соседнюю колонку модели. Колонка
+        # обычно шире метки модели; берём ~ширину заголовка модели как полупорог.
+        model_w = max((float(mr.x1) - float(mr.x0) for mr in model_rects), default=40.0)
+        x_tol = max(model_w * 0.7, 25.0)
         cell, best = None, float("inf")
         for cell_rect in value_cells:
             cx, cy = _center(cell_rect)
