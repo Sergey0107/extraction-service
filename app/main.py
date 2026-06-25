@@ -3157,7 +3157,46 @@ async def _get_render_lock(key: str) -> asyncio.Lock:
         return lock
 
 
+_classify_cache: dict[str, dict[str, bool]] = {}
+
+
+def _file_content_hash(local_path: str) -> str:
+    """Быстрый хеш содержимого файла для кэша классификации: размер + первые/
+    последние 256 КБ (достаточно для уникальности PDF без чтения всего файла)."""
+    h = hashlib.sha256()
+    size = os.path.getsize(local_path)
+    h.update(str(size).encode())
+    with open(local_path, "rb") as f:
+        h.update(f.read(262144))
+        if size > 524288:
+            f.seek(-262144, os.SEEK_END)
+            h.update(f.read(262144))
+    return h.hexdigest()
+
+
 def _classify_pdf_for_preview(local_path: str) -> dict[str, bool]:
+    """Классифицирует PDF для превью: что с ним не так и нужна ли растеризация.
+
+    Вердикт кэшируется по хешу содержимого: один и тот же файл, загруженный
+    повторно (под другим storage_path/URL), не проходит дорогую классификацию
+    (OSD скан-страниц) заново."""
+    try:
+        content_key = _file_content_hash(local_path)
+        cached = _classify_cache.get(content_key)
+        if cached is not None:
+            return cached
+    except Exception:
+        content_key = None
+    result = _classify_pdf_for_preview_uncached(local_path)
+    if content_key is not None:
+        # Ограничиваем рост кэша (простая защита от утечки памяти).
+        if len(_classify_cache) > 512:
+            _classify_cache.clear()
+        _classify_cache[content_key] = result
+    return result
+
+
+def _classify_pdf_for_preview_uncached(local_path: str) -> dict[str, bool]:
     """Классифицирует PDF для превью: что с ним не так и нужна ли растеризация.
 
     Растеризуем (с выпрямлением), если документ показался бы криво или подсветка
@@ -3217,7 +3256,7 @@ def _classify_pdf_for_preview(local_path: str) -> dict[str, bool]:
             # растеризация с авто-поворотом, иначе превью покажет документ криво и
             # подсветка (привязанная к выпрямленному OCR-индексу) не совпадёт.
             if scan_pages and not info["rotated"]:
-                if _scan_pages_are_rotated(doc, scan_pages[:3]):
+                if _scan_pages_are_rotated(doc, scan_pages[:2]):
                     info["scan_rotated"] = True
         finally:
             doc.close()
@@ -3238,29 +3277,35 @@ def _classify_pdf_for_preview(local_path: str) -> dict[str, bool]:
 def _scan_pages_are_rotated(doc: Any, page_indices: list[int]) -> bool:
     """Проверяет через Tesseract OSD, повёрнуто ли содержимое скан-страниц.
     Возвращает True, если хотя бы одна страница уверенно распознана повёрнутой
-    (rotate != 0). Используется для превью: PDF /Rotate=0, но картинка боком."""
+    (rotate != 0). Используется для превью: PDF /Rotate=0, но картинка боком.
+
+    Оптимизация скорости: рендер при низком DPI (для OSD достаточно ~100), и
+    останавливаемся на ПЕРВОЙ повёрнутой странице. OSD — дорогая операция (десятки
+    секунд на документ при высоком DPI и нескольких страницах), а для определения
+    «повёрнут ли скан» хватает грубого превью одной-двух страниц."""
     try:
         import pytesseract
         from PIL import Image
         import io
     except Exception:
         return False
-    rotated_votes = 0
-    checked = 0
+    # 100 DPI достаточно для OSD и вдвое-втрое быстрее 150; psm=0 — только OSD.
+    osd_config = "--psm 0"
     for i in page_indices:
         try:
             page = doc.load_page(i)
-            pix = page.get_pixmap(matrix=fitz.Matrix(150 / 72, 150 / 72), alpha=False)
+            pix = page.get_pixmap(matrix=fitz.Matrix(100 / 72, 100 / 72), alpha=False)
             img = Image.open(io.BytesIO(pix.tobytes("png")))
-            osd = pytesseract.image_to_osd(img, output_type=pytesseract.Output.DICT)
+            osd = pytesseract.image_to_osd(
+                img, output_type=pytesseract.Output.DICT, config=osd_config
+            )
             rotate = int(osd.get("rotate", 0) or 0)
             conf = float(osd.get("orientation_conf", 0) or 0)
-            checked += 1
             if rotate % 360 != 0 and conf >= 2.0:
-                rotated_votes += 1
+                return True  # нашли повёрнутую — дальше проверять незачем
         except Exception:
             continue
-    return checked > 0 and rotated_votes > 0
+    return False
 
 
 def _pdf_needs_rasterization(local_path: str) -> bool:
