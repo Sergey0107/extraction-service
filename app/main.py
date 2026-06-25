@@ -1348,6 +1348,31 @@ def _model_term_rects(page_index: PdfPageIndex, context_terms: list[str]) -> lis
     return rects
 
 
+def _model_rects_from_words(page_index: PdfPageIndex, context_terms: list[str]) -> list[Any]:
+    """Прямоугольники кода модели, найденные по СЛОВАМ страницы (page_index.words).
+
+    В отличие от _model_term_rects (через page.search_for), работает и на OCR-страницах,
+    где реального текстового слоя нет. Ищем числовое ядро типоразмера ('50-110') как
+    подстроку в нормализованном тексте каждого слова — паспорт пишет заголовок столбца
+    модели как '50-110', '1Кс50-110', '50-110-...' и т.п."""
+    cores: list[str] = []
+    for term in context_terms:
+        for core in _model_numeric_cores(term):
+            norm_core = _normalize_match_text(core)
+            if len(norm_core) >= 4 and norm_core not in cores:
+                cores.append(norm_core)
+    if not cores:
+        return []
+    rects: list[Any] = []
+    for word in page_index.words:
+        wn = word.normalized
+        for core in cores:
+            if core in wn:
+                rects.append(word.rect)
+                break
+    return rects
+
+
 def _value_cells_in_table(page_index: PdfPageIndex, norm_value: str) -> list[Any]:
     """Все ячейки таблиц, текст которых равен искомому значению."""
     tables = _get_page_tables(page_index)
@@ -1388,15 +1413,27 @@ def _search_value_in_model_table(
     norm_value = _normalize_match_text(value_text)
     if not norm_value:
         return None, 0.0
-    model_rects = _model_term_rects(page_index, context_terms)
+
+    # Работаем НАПРЯМУЮ по словам страницы (page_index.words), а не через
+    # page.search_for()/find_tables — на OCR-страницах (сканы) реального текстового
+    # слоя нет, и оба не работают. Слова же есть всегда (из текстового слоя или OCR),
+    # поэтому word-based поиск универсален.
+    model_rects = _model_rects_from_words(page_index, context_terms)
     if not model_rects:
         return None, 0.0
-    value_cells = _value_cells_in_table(page_index, norm_value)
+    # Ячейки-кандидаты со значением — слова, чей нормализованный текст равен искомому.
+    value_cells = [w.rect for w in page_index.words if w.normalized == norm_value]
     if not value_cells:
         return None, 0.0
 
     def _center(rect: Any) -> tuple[float, float]:
         return ((float(rect.x0) + float(rect.x1)) / 2, (float(rect.y0) + float(rect.y1)) / 2)
+
+    # Высота строки модели — масштаб допусков (OCR-слова мельче ячеек таблиц).
+    model_h = max(
+        (float(mr.y1) - float(mr.y0) for mr in model_rects), default=12.0
+    ) or 12.0
+    y_tol = max(model_h * 0.8, 8.0)
 
     def _layout_same_row() -> Any | None:
         """Значение на ОДНОЙ СТРОКЕ с кодом модели (обычная раскладка)."""
@@ -1404,42 +1441,73 @@ def _search_value_in_model_table(
         for cell_rect in value_cells:
             _, cy = _center(cell_rect)
             for mr in model_rects:
-                y0, y1 = float(mr.y0) - 3, float(mr.y1) + 3
+                y0, y1 = float(mr.y0) - y_tol, float(mr.y1) + y_tol
                 d = 0.0 if y0 <= cy <= y1 else min(abs(cy - y0), abs(cy - y1))
                 if d < dist:
                     dist, cell = d, cell_rect
-        return cell if (cell is not None and dist <= 6) else None
+        return cell if (cell is not None and dist <= y_tol) else None
 
     def _layout_transposed() -> Any | None:
-        """Транспонированная: пересечение СТОЛБЦА модели (X) и СТРОКИ параметра (Y)."""
+        """Транспонированная: пересечение СТОЛБЦА модели (X) и СТРОКИ параметра (Y).
+
+        Выбираем ячейку значения, X которой ближе всего к X-столбцу модели, а Y —
+        к Y-строке параметра. Это устраняет неоднозначность, когда одно и то же число
+        (напр. '280') встречается в нескольких строках/столбцах."""
         if not param_label:
             return None
         norm_label = _normalize_match_text(param_label)
-        # Метку строки (L/B/H) ищем в word index — search_for не находит одиночные буквы.
-        label_words = [w for w in page_index.words if w.normalized == norm_label]
+        # Для односимвольных меток (L/B/H) — точное совпадение (иначе 'l' ловит всё).
+        # Для словесных ('масса') — точное ИЛИ префиксное (OCR склеивает 'Масса,кг').
+        if len(norm_label) <= 2:
+            label_words = [w for w in page_index.words if w.normalized == norm_label]
+        else:
+            label_words = [
+                w for w in page_index.words
+                if w.normalized == norm_label or w.normalized.startswith(norm_label)
+            ]
         if not label_words:
             return None
+        # Метка строки — самая левая (это подпись строки, а не значение в ячейке).
         leftmost_x = min(float(w.rect.x0) for w in label_words)
-        param_rects = [w.rect for w in label_words if float(w.rect.x0) <= leftmost_x + 30]
+        param_rects = [w.rect for w in label_words if float(w.rect.x0) <= leftmost_x + 40]
         if not param_rects:
             return None
         model_xs = [(float(mr.x0) + float(mr.x1)) / 2 for mr in model_rects]
+        x_tol = max(model_h * 4, 60.0)
         cell, best = None, float("inf")
         for cell_rect in value_cells:
             cx, cy = _center(cell_rect)
             x_dist = min(abs(cx - mx) for mx in model_xs)
             y_dist = min(
-                0.0 if (float(pr.y0) - 4) <= cy <= (float(pr.y1) + 4)
+                0.0 if (float(pr.y0) - y_tol) <= cy <= (float(pr.y1) + y_tol)
                 else min(abs(cy - float(pr.y0)), abs(cy - float(pr.y1)))
                 for pr in param_rects
             )
-            if y_dist <= 6 and x_dist <= 40:
+            if y_dist <= y_tol and x_dist <= x_tol:
                 score = y_dist * 3 + x_dist
                 if score < best:
                     best, cell = score, cell_rect
         return cell
 
-    # Для габаритов (есть метка параметра L/B/H) сначала пробуем транспонированную
+    def _layout_column_only() -> tuple[Any | None, float]:
+        """Fallback: значение в СТОЛБЦЕ модели (ближайшее по X к заголовку модели),
+        НИЖЕ заголовка. Применяется, когда метку строки (Масса/L/B/H) OCR не распознал —
+        тогда нельзя выбрать точную строку, но можно хотя бы попасть в нужный столбец,
+        что устраняет грубую ошибку (значение из чужой модели). Уверенность ниже."""
+        model_xs = [(float(mr.x0) + float(mr.x1)) / 2 for mr in model_rects]
+        header_bottom = max(float(mr.y1) for mr in model_rects)
+        x_tol = max(model_h * 4, 60.0)
+        cell, best = None, float("inf")
+        for cell_rect in value_cells:
+            cx, cy = _center(cell_rect)
+            if cy < header_bottom:  # выше заголовка модели — не данные этой таблицы
+                continue
+            x_dist = min(abs(cx - mx) for mx in model_xs)
+            if x_dist <= x_tol and x_dist < best:
+                best, cell = x_dist, cell_rect
+        return (cell, 0.5) if cell is not None else (None, 0.0)
+
+    # Для габаритов и веса (есть метка строки) сначала пробуем транспонированную
     # раскладку — иначе значение случайно «прилипает» к заголовку модели по Y.
     if param_label:
         cell = _layout_transposed() or _layout_same_row()
@@ -1447,6 +1515,9 @@ def _search_value_in_model_table(
         cell = _layout_same_row() or _layout_transposed()
     if cell is not None:
         return cell, 0.88
+    # Метку строки не нашли (плохой OCR) — пробуем хотя бы попасть в столбец модели.
+    if param_label:
+        return _layout_column_only()
     return None, 0.0
 
 
@@ -1465,6 +1536,25 @@ def _dimension_param_label(anchor_text: str) -> str | None:
     for key, variants in _DIMENSION_LABELS.items():
         if key in norm:
             return variants[0].upper()
+    return None
+
+
+def _weight_param_label(anchor_text: str) -> str | None:
+    """Для характеристик веса/массы насоса возвращает метку строки 'масса' —
+    в таблицах габаритов масса идёт отдельной строкой 'Масса, кг', значения которой
+    разнесены по столбцам моделей. Это позволяет искать ячейку массы на пересечении
+    строки 'Масса' и столбца нужной модели, а не первое попавшееся число.
+
+    Только для веса/массы НАСОСА — не для электродвигателя/плиты/агрегата, чьи
+    значения в этой таблице отсутствуют."""
+    norm = _normalize_match_text(anchor_text)
+    if "электродвигател" in norm or "плит" in norm or "агрегат" in norm or "общий" in norm:
+        return None
+    if "вес насоса" in norm or "масса насоса" in norm or norm in {"вес насоса", "масса насоса"}:
+        return "масса"
+    # "Вес: Насоса" → нормализуется в "вес насоса"
+    if ("вес" in norm or "масс" in norm) and "насос" in norm:
+        return "масса"
     return None
 
 
@@ -1702,6 +1792,14 @@ def _find_reference_location(
             if lbl:
                 param_label = lbl
                 break
+        # Контекст характеристики (название) тоже может содержать метку — для веса
+        # ("Вес: Насоса") она не лежит в candidates, поэтому проверяем context_terms.
+        if param_label is None:
+            for term in context_terms:
+                lbl = _dimension_param_label(term) or _weight_param_label(term)
+                if lbl:
+                    param_label = lbl
+                    break
         if param_label:
             page_hint = _safe_page_number(value_cand.get("page_hint"))
             for page_index in _sorted_pages(page_hint, nearby_only=bool(page_hint and large_doc)):
