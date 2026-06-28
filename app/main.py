@@ -154,6 +154,19 @@ def _looks_like_docx(filename: str, content_type: str | None) -> bool:
     )
 
 
+def _looks_like_excel(filename: str, content_type: str | None) -> bool:
+    normalized = (content_type or "").split(";", 1)[0].strip().lower()
+    suffix = Path(filename).suffix.lower()
+    return (
+        normalized
+        in {
+            "application/vnd.ms-excel",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        }
+        or suffix in {".xls", ".xlsx", ".xlsm"}
+    )
+
+
 def _looks_like_pdf(filename: str, content_type: str | None) -> bool:
     normalized = (content_type or "").split(";", 1)[0].strip().lower()
     suffix = Path(filename).suffix.lower()
@@ -2504,6 +2517,58 @@ def _convert_docx_to_structured_text(local_path: str) -> dict[str, Any]:
     }
 
 
+def _convert_xlsx_to_structured_text(local_path: str) -> dict[str, Any]:
+    """Извлекает текст из Excel-книги для передачи в LLM.
+
+    Каждый лист сериализуется как таблица: строки с непустыми ячейками,
+    разделённые ' | '. Формат повторяет DOCX-таблицы ('[T..R..] ...'), чтобы
+    LLM одинаково понимал табличную структуру независимо от исходного формата.
+    Пустые строки и полностью пустые листы пропускаются."""
+    import openpyxl
+
+    workbook = openpyxl.load_workbook(local_path, read_only=True, data_only=True)
+    lines: list[str] = []
+    sheet_count = 0
+    row_count = 0
+    try:
+        for sheet in workbook.worksheets:
+            rows_serialized: list[str] = []
+            seen_rows: set[tuple[str, ...]] = set()
+            for row in sheet.iter_rows(values_only=True):
+                cells = tuple(
+                    re.sub(r"\s+", " ", str(value)).strip() if value is not None else ""
+                    for value in row
+                )
+                # Обрезаем хвост пустых ячеек, чтобы '—' не плодились до конца листа.
+                while cells and cells[-1] == "":
+                    cells = cells[:-1]
+                if not any(cells):
+                    continue
+                if cells in seen_rows:
+                    continue
+                seen_rows.add(cells)
+                rows_serialized.append(cells)
+            if not rows_serialized:
+                continue
+            sheet_count += 1
+            sheet_name = _clean_docx_text(sheet.title) or f"Sheet{sheet_count}"
+            lines.append(f"[S{sheet_count}: {sheet_name}] SHEET START")
+            for row_index, cells in enumerate(rows_serialized, start=1):
+                row_count += 1
+                serialized = " | ".join(cell if cell else "—" for cell in cells)
+                lines.append(f"[S{sheet_count}R{row_index}] {serialized}")
+            lines.append(f"[S{sheet_count}] SHEET END")
+    finally:
+        workbook.close()
+
+    structured_text = "\n".join(lines).strip()
+    return {
+        "text": structured_text,
+        "sheet_count": sheet_count,
+        "row_count": row_count,
+    }
+
+
 def _convert_office_document_to_pdf(local_path: str, output_dir: str) -> str:
     source_path = Path(local_path)
     target_dir = Path(output_dir)
@@ -2918,12 +2983,14 @@ async def _extract_via_openrouter(payload: ExtractionRequest) -> dict[str, Any]:
 
     downloaded_file = await _download_file(payload.file_url)
     is_docx = _looks_like_docx(downloaded_file.filename, downloaded_file.content_type)
+    is_excel = _looks_like_excel(downloaded_file.filename, downloaded_file.content_type)
     is_pdf = _looks_like_pdf(downloaded_file.filename, downloaded_file.content_type)
     logger.info(
-        "File detected: filename=%r content_type=%r is_docx=%s is_pdf=%s",
-        downloaded_file.filename, downloaded_file.content_type, is_docx, is_pdf,
+        "File detected: filename=%r content_type=%r is_docx=%s is_excel=%s is_pdf=%s",
+        downloaded_file.filename, downloaded_file.content_type, is_docx, is_excel, is_pdf,
     )
     docx_conversion_metadata: dict[str, Any] | None = None
+    excel_conversion_metadata: dict[str, Any] | None = None
     pdf_conversion_metadata: dict[str, Any] | None = None
     docx_pdf_temp_dir: tempfile.TemporaryDirectory | None = None
 
@@ -2938,6 +3005,20 @@ async def _extract_via_openrouter(payload: ExtractionRequest) -> dict[str, Any]:
                 status_code=502,
                 detail=(
                     f"DOCX conversion failed: {exc}\n\n"
+                    f"Extraction service traceback:\n{traceback.format_exc()}"
+                ),
+            ) from exc
+    elif is_excel:
+        try:
+            excel_conversion_metadata = await to_thread.run_sync(
+                lambda: _convert_xlsx_to_structured_text(downloaded_file.local_path)
+            )
+        except Exception as exc:
+            logger.exception("Excel conversion failed")
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    f"Excel conversion failed: {exc}\n\n"
                     f"Extraction service traceback:\n{traceback.format_exc()}"
                 ),
             ) from exc
@@ -2968,6 +3049,9 @@ async def _extract_via_openrouter(payload: ExtractionRequest) -> dict[str, Any]:
     if is_docx and docx_conversion_metadata:
         use_text_path = True
         document_text = (docx_conversion_metadata or {}).get("text", "")
+    elif is_excel and excel_conversion_metadata:
+        use_text_path = True
+        document_text = (excel_conversion_metadata or {}).get("text", "")
     elif is_pdf and pdf_conversion_metadata:
         extracted_text = pdf_conversion_metadata.get("text", "")
         ocr_was_applied = pdf_conversion_metadata.get("ocr_applied", False)
@@ -3066,7 +3150,11 @@ async def _extract_via_openrouter(payload: ExtractionRequest) -> dict[str, Any]:
             )
         # Нормализуем references: некоторые модели возвращают dict вместо list
         _normalize_references_in_place(extracted_data)
-        if is_docx:
+        # Office-документы (DOCX/Excel) конвертируем в PDF, чтобы геометрия привязала
+        # координаты цитат к страницам PDF-превью (вьювер показывает именно его).
+        if is_docx or is_excel:
+            office_meta = docx_conversion_metadata if is_docx else excel_conversion_metadata
+            doc_kind = "DOCX" if is_docx else "Excel"
             try:
                 docx_pdf_temp_dir = tempfile.TemporaryDirectory()
                 geometry_local_path = await to_thread.run_sync(
@@ -3076,12 +3164,12 @@ async def _extract_via_openrouter(payload: ExtractionRequest) -> dict[str, Any]:
                     )
                 )
                 geometry_content_type = "application/pdf"
-                if docx_conversion_metadata is not None:
-                    docx_conversion_metadata["pdf_preview"] = {"created": True}
+                if office_meta is not None:
+                    office_meta["pdf_preview"] = {"created": True}
             except Exception as exc:
-                logger.exception("DOCX PDF preview conversion failed")
-                if docx_conversion_metadata is not None:
-                    docx_conversion_metadata["pdf_preview"] = {
+                logger.exception("%s PDF preview conversion failed", doc_kind)
+                if office_meta is not None:
+                    office_meta["pdf_preview"] = {
                         "created": False,
                         "error": str(exc),
                     }
@@ -3127,6 +3215,7 @@ async def _extract_via_openrouter(payload: ExtractionRequest) -> dict[str, Any]:
             "provider_usage": provider_response.get("usage"),
             "geometry": geometry_metadata,
             "docx_conversion": docx_conversion_metadata,
+            "excel_conversion": excel_conversion_metadata,
             "pdf_conversion": pdf_conversion_metadata,
         },
     }

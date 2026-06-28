@@ -9,6 +9,7 @@ ENV PIP_DEFAULT_TIMEOUT=1000
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         libreoffice-writer \
+        libreoffice-calc \
         fonts-dejavu \
         fonts-liberation \
         tesseract-ocr \
