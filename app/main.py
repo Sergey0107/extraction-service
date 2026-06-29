@@ -173,6 +173,14 @@ def _looks_like_pdf(filename: str, content_type: str | None) -> bool:
     return normalized == "application/pdf" or suffix == ".pdf"
 
 
+# Таймаут на ОДИН вызов Tesseract (на страницу). Нормальный OCR страницы — секунды;
+# но на некоторых сканах с шумом/паттернами Tesseract LSTM зацикливается и висит
+# минутами, блокируя всю задачу извлечения навсегда. Лимит превращает зависание в
+# обрабатываемую ошибку (страница пропускается / падаем на другой путь).
+OCR_PAGE_TIMEOUT_SECONDS = 45
+OCR_OSD_TIMEOUT_SECONDS = 20
+
+
 def _auto_orient_for_ocr(img):
     """Доворачивает изображение страницы в правильную ориентацию перед OCR.
 
@@ -183,7 +191,9 @@ def _auto_orient_for_ocr(img):
     try:
         import pytesseract
 
-        osd = pytesseract.image_to_osd(img, output_type=pytesseract.Output.DICT)
+        osd = pytesseract.image_to_osd(
+            img, output_type=pytesseract.Output.DICT, timeout=OCR_OSD_TIMEOUT_SECONDS
+        )
         rotate = int(osd.get("rotate", 0) or 0)
         conf = float(osd.get("orientation_conf", 0) or 0)
         if rotate and conf >= 1.0:
@@ -417,7 +427,9 @@ def _augment_sparse_pages_with_ocr(
             pix = page.get_pixmap(matrix=fitz.Matrix(DPI / 72, DPI / 72), alpha=False)
             img = Image.open(io.BytesIO(pix.tobytes("png")))
             img = _auto_orient_for_ocr(img)
-            ocr_text = pytesseract.image_to_string(img, lang="rus+eng").strip()
+            ocr_text = pytesseract.image_to_string(
+                img, lang="rus+eng", timeout=OCR_PAGE_TIMEOUT_SECONDS
+            ).strip()
         except Exception:
             continue
         if len(ocr_text) >= len((updated[i] or "").strip()) + min_ocr_gain:
@@ -514,7 +526,13 @@ def _convert_pdf_to_structured_text(
                     pix = page.get_pixmap(matrix=mat, alpha=False)
                     img = Image.open(io.BytesIO(pix.tobytes("png")))
                     img = _auto_orient_for_ocr(img)
-                    text = pytesseract.image_to_string(img, lang="rus+eng").strip()
+                    try:
+                        text = pytesseract.image_to_string(
+                            img, lang="rus+eng", timeout=OCR_PAGE_TIMEOUT_SECONDS
+                        ).strip()
+                    except RuntimeError as exc:
+                        logger.warning("OCR timeout/error on page %d: %s", i + 1, exc)
+                        text = ""
                     if text:
                         lines.append(f"[PAGE {i + 1}]")
                         lines.append(text)
@@ -1174,6 +1192,7 @@ def _build_pdf_page_index_ocr(local_path: str) -> tuple[Any, list[PdfPageIndex]]
                 img,
                 lang="rus+eng",
                 output_type=pytesseract.Output.DICT,
+                timeout=OCR_PAGE_TIMEOUT_SECONDS,
             )
         except Exception as exc:
             logger.warning("OCR failed for page %d: %s", page_index + 1, exc)
@@ -3492,7 +3511,10 @@ def _scan_pages_are_rotated(doc: Any, page_indices: list[int]) -> bool:
             pix = page.get_pixmap(matrix=fitz.Matrix(100 / 72, 100 / 72), alpha=False)
             img = Image.open(io.BytesIO(pix.tobytes("png")))
             osd = pytesseract.image_to_osd(
-                img, output_type=pytesseract.Output.DICT, config=osd_config
+                img,
+                output_type=pytesseract.Output.DICT,
+                config=osd_config,
+                timeout=OCR_OSD_TIMEOUT_SECONDS,
             )
             rotate = int(osd.get("rotate", 0) or 0)
             conf = float(osd.get("orientation_conf", 0) or 0)
