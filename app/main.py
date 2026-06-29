@@ -363,6 +363,53 @@ def _filter_relevant_pages(
     return relevant, True
 
 
+def _augment_sparse_pages_with_ocr(
+    document: Any,
+    all_pages_text: list[str],
+    *,
+    sparse_threshold: int = 150,
+    min_ocr_gain: int = 200,
+) -> tuple[list[str], int]:
+    """Для страниц с бедным текстовым слоем прогоняет OCR и подменяет их текст.
+
+    Кейс: документ в основном текстовый (описание читается), но таблицы ТТХ
+    нарисованы векторной графикой/картинкой без ToUnicode — get_text() для такой
+    страницы почти пуст, и характеристики теряются. Если OCR такой страницы даёт
+    существенно больше текста (min_ocr_gain), берём OCR-вариант.
+
+    Возвращает (обновлённый список текстов, число заменённых страниц)."""
+    sparse_indices = [
+        i for i, t in enumerate(all_pages_text)
+        if len((t or "").strip()) < sparse_threshold
+    ]
+    if not sparse_indices:
+        return all_pages_text, 0
+    try:
+        import pytesseract
+        from PIL import Image
+        import io
+        pytesseract.get_tesseract_version()
+    except Exception:
+        return all_pages_text, 0
+
+    DPI = 200
+    updated = list(all_pages_text)
+    replaced = 0
+    for i in sparse_indices:
+        try:
+            page = document.load_page(i)
+            pix = page.get_pixmap(matrix=fitz.Matrix(DPI / 72, DPI / 72), alpha=False)
+            img = Image.open(io.BytesIO(pix.tobytes("png")))
+            img = _auto_orient_for_ocr(img)
+            ocr_text = pytesseract.image_to_string(img, lang="rus+eng").strip()
+        except Exception:
+            continue
+        if len(ocr_text) >= len((updated[i] or "").strip()) + min_ocr_gain:
+            updated[i] = ocr_text
+            replaced += 1
+    return updated, replaced
+
+
 def _convert_pdf_to_structured_text(
     local_path: str,
     target_names: list[str] | None = None,
@@ -404,6 +451,19 @@ def _convert_pdf_to_structured_text(
 
     pages_filtered = False
     if has_text:
+        # «Смешанный» PDF: часть страниц имеет нормальный текстовый слой (описание),
+        # а ключевые таблицы характеристик нарисованы как векторная графика/картинка
+        # без ToUnicode — их get_text() почти пуст, и LLM не видит значений. Для таких
+        # «бедных» страниц прогоняем OCR и подменяем их текст распознанным.
+        all_pages_text, augmented = _augment_sparse_pages_with_ocr(
+            document, all_pages_text
+        )
+        if augmented:
+            ocr_applied = True
+            logger.info(
+                "PDF mixed-content: OCR-augmented %d sparse page(s) with image/vector tables",
+                augmented,
+            )
         relevant_pages, pages_filtered = _filter_relevant_pages(
             all_pages_text, target_names
         )
