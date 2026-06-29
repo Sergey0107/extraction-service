@@ -2687,7 +2687,14 @@ def _convert_office_document_to_pdf(local_path: str, output_dir: str) -> str:
         str(target_dir),
         str(source_path),
     ]
-    result = subprocess.run(command, capture_output=True, text=True, timeout=90, check=False)
+    # Изолируем HOME/GNUPGHOME в temp-профиль: иначе LibreOffice трогает общий
+    # gpg-agent и плодит фоновые gpg-процессы, которые становятся зомби.
+    env = dict(os.environ)
+    env["HOME"] = str(profile_dir)
+    env["GNUPGHOME"] = str(profile_dir / "gnupg")
+    result = subprocess.run(
+        command, capture_output=True, text=True, timeout=90, check=False, env=env
+    )
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "LibreOffice conversion failed").strip()
         raise RuntimeError(detail)
