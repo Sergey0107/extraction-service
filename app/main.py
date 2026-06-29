@@ -214,8 +214,31 @@ def _text_layer_is_usable(text: str) -> bool:
     words = re.findall(r"[^\W\d_]{3,}", stripped, re.UNICODE)
     letters_in_words = sum(len(w) for w in words)
     word_ratio = letters_in_words / len(letters)
-    # У нормального текста (RU/EN) word_ratio ~0.9; у мусора-кодировки ~0.4-0.5.
-    return word_ratio >= 0.6
+    # У нормального текста (RU/EN) word_ratio ~0.9; у мусора одиночных символов ~0.4-0.5.
+    if word_ratio < 0.6:
+        return False
+
+    # Битая кодировка кириллического шрифта (нет/сломан ToUnicode): get_text() даёт
+    # «слова» из латиницы вперемешку, визуально читаемые как русский, но это мусор
+    # ('HanuenoaaHne', 'CraqnoHapHurfi', 'qECKI4X'). word_ratio при этом высокий, и
+    # такой текст проходил проверку выше. Признак мусора — аномально много «слов» со
+    # СМЕШАННЫМ регистром ВНУТРИ слова (заглавная не в начале): в нормальном тексте
+    # (RU и EN) так пишут редко, у битой кодировки — почти каждое второе слово.
+    if len(words) >= 20:
+        cyrillic = sum(1 for ch in letters if "Ѐ" <= ch <= "ӿ")
+        cyrillic_ratio = cyrillic / len(letters)
+        mixed_case = 0
+        for w in words:
+            inner = w[1:]
+            if any(ch.isupper() for ch in inner) and any(ch.islower() for ch in inner):
+                mixed_case += 1
+        mixed_ratio = mixed_case / len(words)
+        # Документы здесь русскоязычные. Если кириллицы почти нет, а доля слов с
+        # «рваным» регистром высокая — это битая кодировка, нужен OCR.
+        if cyrillic_ratio < 0.15 and mixed_ratio >= 0.2:
+            return False
+
+    return True
 
 
 def _text_layer_has_enough_content(all_pages_text: list[str]) -> bool:
