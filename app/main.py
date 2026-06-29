@@ -688,11 +688,18 @@ def _raise_provider_http_error(response: httpx.Response, provider_name: str) -> 
 def _json_schema_response_format(name: str, schema: dict[str, Any]) -> dict[str, Any]:
     if LLM_IS_YANDEX:
         return {"type": "json_object"}
+    # strict=False: схема передаётся модели как ОРИЕНТИР, без жёсткой валидации
+    # структуры. Это критично для gpt-4.1 (и новее): в strict-режиме OpenAI требует
+    # 'additionalProperties': false и полный 'required' в КАЖДОМ объекте схемы,
+    # а наша схема с references/bbox/anyOf этим требованиям не удовлетворяет —
+    # strict-запрос отклонялся с 400, падал в fallback без схемы, и модель
+    # возвращала голый массив (non-object JSON → весь анализ failed).
+    # Со strict=False gpt-4.1 корректно возвращает {products: [...]}.
     return {
         "type": "json_schema",
         "json_schema": {
             "name": name,
-            "strict": True,
+            "strict": False,
             "schema": schema,
         },
     }
@@ -2455,6 +2462,16 @@ async def _chat_completion_json(
         else:
             raise RuntimeError(diagnostic) from exc
     if not isinstance(parsed, dict):
+        # Некоторые модели (gpt-4.1 в fallback без схемы) возвращают JSON-массив
+        # на верхнем уровне вместо объекта {products: [...]}. Не падаем, а
+        # оборачиваем: список изделий или плоский список характеристик — это
+        # валидные данные, дальше их нормализует gateway.
+        if isinstance(parsed, list):
+            logger.info(
+                "%s returned a top-level JSON array — wrapping into {products: [...]}",
+                provider_name,
+            )
+            return {"products": parsed}, data, used_fallback
         raise RuntimeError(f"{provider_name} returned non-object JSON")
     return parsed, data, used_fallback
 
