@@ -219,23 +219,39 @@ def _text_layer_is_usable(text: str) -> bool:
         return False
 
     # Битая кодировка кириллического шрифта (нет/сломан ToUnicode): get_text() даёт
-    # «слова» из латиницы вперемешку, визуально читаемые как русский, но это мусор
-    # ('HanuenoaaHne', 'CraqnoHapHurfi', 'qECKI4X'). word_ratio при этом высокий, и
-    # такой текст проходил проверку выше. Признак мусора — аномально много «слов» со
-    # СМЕШАННЫМ регистром ВНУТРИ слова (заглавная не в начале): в нормальном тексте
-    # (RU и EN) так пишут редко, у битой кодировки — почти каждое второе слово.
+    # «слова», визуально читаемые как русский, но это мусор. word_ratio при этом
+    # высокий, и такой текст проходил проверку выше. Ловим двумя признаками:
     if len(words) >= 20:
-        cyrillic = sum(1 for ch in letters if "Ѐ" <= ch <= "ӿ")
+        def _is_cyr(ch: str) -> bool:
+            return "Ѐ" <= ch <= "ӿ"
+
+        def _is_lat(ch: str) -> bool:
+            return ("a" <= ch <= "z") or ("A" <= ch <= "Z")
+
+        cyrillic = sum(1 for ch in letters if _is_cyr(ch))
         cyrillic_ratio = cyrillic / len(letters)
-        mixed_case = 0
+
+        mixed_case = 0      # 'HanuenoaaHne' — заглавная не в начале слова
+        mixed_script = 0    # 'ВзiпIеll' — кириллица И латиница в одном слове
         for w in words:
             inner = w[1:]
             if any(ch.isupper() for ch in inner) and any(ch.islower() for ch in inner):
                 mixed_case += 1
-        mixed_ratio = mixed_case / len(words)
-        # Документы здесь русскоязычные. Если кириллицы почти нет, а доля слов с
-        # «рваным» регистром высокая — это битая кодировка, нужен OCR.
-        if cyrillic_ratio < 0.15 and mixed_ratio >= 0.2:
+            has_cyr = any(_is_cyr(ch) for ch in w)
+            has_lat = any(_is_lat(ch) for ch in w)
+            if has_cyr and has_lat:
+                mixed_script += 1
+        mixed_case_ratio = mixed_case / len(words)
+        mixed_script_ratio = mixed_script / len(words)
+
+        # 1. Латиница-вместо-кириллицы ('HanuenoaaHne'): кириллицы почти нет,
+        #    но много «рваного» регистра.
+        if cyrillic_ratio < 0.15 and mixed_case_ratio >= 0.2:
+            return False
+        # 2. Кириллица + латиница намешаны в одних словах ('ВзiпIеll', 'llсilrr'):
+        #    в нормальном тексте смешение скриптов внутри слова — единичные случаи
+        #    (бренды вроде 'iPhone'), у битой кодировки — массово.
+        if mixed_script_ratio >= 0.15:
             return False
 
     return True
