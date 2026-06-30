@@ -1989,7 +1989,33 @@ def _search_table_row_candidate(
     try:
         tables = _get_page_tables(page_index)
         for table in (tables.tables if tables else []):
-            for row in table.rows:
+            # Строки-заголовки таблицы (подписи колонок) НЕ содержат значений —
+            # привязка к ним даёт выделение заголовка. Например название
+            # характеристики «материал проточной части» совпадает токенами с
+            # ЗАГОЛОВКОМ колонки «Материал». Определяем заголовочные строки и
+            # пропускаем их ячейки. Заголовок — это верхние строки, где почти нет
+            # числовых ячеек (подписи), по аналогии с _serialize_table_markdown.
+            header_row_count = 0
+            try:
+                ext = table.extract()
+                for r in ext[: min(2, len(ext))]:
+                    cells_txt = [_normalize_match_text("" if c is None else str(c)) for c in r]
+                    cells_txt = [c for c in cells_txt if c]
+                    if not cells_txt:
+                        header_row_count += 1
+                        continue
+                    numeric = sum(1 for c in cells_txt if _cell_is_numeric(c))
+                    if numeric <= max(0, len(cells_txt) // 3):
+                        header_row_count += 1
+                    else:
+                        break
+            except Exception:
+                header_row_count = 1
+            header_row_count = max(1, header_row_count)
+
+            for row_idx, row in enumerate(table.rows):
+                if row_idx < header_row_count:
+                    continue  # пропускаем строки-заголовки
                 for cell in row.cells:
                     if cell is None:
                         continue
@@ -2001,11 +2027,20 @@ def _search_table_row_candidate(
                     cell_normalized = _normalize_match_text(cell_text)
                     if not cell_normalized:
                         continue
-                    if (
-                        normalized_anchor in cell_normalized
-                        or cell_normalized in normalized_anchor
-                        or _token_overlap_ratio(normalized_anchor, cell_normalized) >= 0.6
-                    ):
+                    # Совпадение должно быть ОСМЫСЛЕННЫМ. Substring-проверка
+                    # «cell in anchor» ложно срабатывала на одиночных символах/цифрах
+                    # (ячейка '5' — подстрока кода модели '...100-65-250'), привязывая
+                    # к произвольной ячейке. Поэтому substring разрешаем только для
+                    # достаточно длинных ячеек (>=4 симв.), а короткие сверяем строго
+                    # по перекрытию токенов.
+                    overlap_ratio = _token_overlap_ratio(normalized_anchor, cell_normalized)
+                    long_enough = len(cell_normalized) >= 4
+                    matched = (
+                        (normalized_anchor in cell_normalized and len(normalized_anchor) >= 4)
+                        or (cell_normalized in normalized_anchor and long_enough)
+                        or overlap_ratio >= 0.6
+                    )
+                    if matched:
                         row_cells = [
                             fitz.Rect(c) if not isinstance(c, fitz.Rect) else c
                             for c in row.cells
