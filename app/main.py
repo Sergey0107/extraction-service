@@ -357,6 +357,21 @@ def _page_is_relevant(text: str, target_names: list[str] | None = None) -> bool:
     return False
 
 
+def _page_has_table(text: str) -> bool:
+    """Страница содержит Markdown-таблицу (вставленную _page_text_with_tables):
+    есть строка-разделитель «| --- | ...». Самый дешёвый и точный признак."""
+    return bool(re.search(r"^\s*\|[\s|:-]*---[\s|:-]*\|", text, re.MULTILINE))
+
+
+def _page_continues_table(text: str) -> bool:
+    """Страница ВЫГЛЯДИТ как продолжение таблицы: начинается со строк «| ... |»,
+    но без строки-заголовка-разделителя «| --- |». Так бывает, когда таблица
+    переходит на следующую страницу — шапка осталась на предыдущей."""
+    stripped = text.lstrip()
+    starts_with_row = stripped.startswith("|")
+    return starts_with_row and not _page_has_table(text)
+
+
 def _filter_relevant_pages(
     all_pages_text: list[str],
     target_names: list[str] | None = None,
@@ -364,26 +379,43 @@ def _filter_relevant_pages(
 ) -> tuple[list[tuple[int, str]], bool]:
     """Returns ([(page_number, text), ...], was_filtered).
     Keeps first page, last page, and any page with characteristic-related keywords.
-    Falls back to all pages if total text is small enough."""
+    Falls back to all pages if total text is small enough.
+
+    Пункт 4 — НЕ разрывать таблицы фильтром: страница с таблицей всегда релевантна,
+    а её соседи (предыдущая/следующая) подтягиваются целиком, чтобы шапку таблицы
+    не оторвало от строк-продолжения на соседней странице."""
     total_len = sum(len(t) for t in all_pages_text)
     if total_len <= max_chars:
         return [(i + 1, t) for i, t in enumerate(all_pages_text) if t.strip()], False
 
-    relevant: list[tuple[int, str]] = []
+    n = len(all_pages_text)
+    keep: set[int] = set()
     for i, text in enumerate(all_pages_text):
         if not text.strip():
             continue
-        if i == 0 or i == len(all_pages_text) - 1:
-            relevant.append((i + 1, text))
+        if i == 0 or i == n - 1:
+            keep.add(i)
             continue
-        if _page_is_relevant(text, target_names):
-            relevant.append((i + 1, text))
+        if _page_has_table(text) or _page_is_relevant(text, target_names):
+            keep.add(i)
+
+    # Целостность таблиц: для каждой страницы с таблицей или её продолжением
+    # подтягиваем непустых соседей, чтобы заголовок и строки не разорвались.
+    for i, text in enumerate(all_pages_text):
+        if not text.strip():
+            continue
+        if _page_has_table(text) or _page_continues_table(text):
+            for j in (i - 1, i + 1):
+                if 0 <= j < n and all_pages_text[j].strip():
+                    keep.add(j)
+
+    relevant = [(i + 1, all_pages_text[i]) for i in sorted(keep)]
 
     if not relevant:
         return [(i + 1, t) for i, t in enumerate(all_pages_text) if t.strip()], False
 
     # If filtering cut too aggressively (< 3 pages), fall back to full text
-    if len(relevant) < 3 and len(all_pages_text) > 5:
+    if len(relevant) < 3 and n > 5:
         return [(i + 1, t) for i, t in enumerate(all_pages_text) if t.strip()], False
 
     return relevant, True
@@ -438,6 +470,90 @@ def _augment_sparse_pages_with_ocr(
     return updated, replaced
 
 
+def _serialize_table_markdown(rows: list[list[Any]]) -> str:
+    """Сериализует таблицу (список строк-списков от find_tables().extract()) в
+    Markdown. Первая строка — заголовок. Пустые ячейки (None) → ''; переводы строк
+    внутри ячеек → пробел. Markdown даёт модели явную привязку
+    «значение → столбец», убирая угадывание по пробелам в плоском тексте."""
+    def _cell(value: Any) -> str:
+        text = "" if value is None else str(value)
+        return re.sub(r"\s+", " ", text).replace("|", "/").strip()
+
+    norm_rows = [[_cell(c) for c in row] for row in rows if row]
+    if not norm_rows:
+        return ""
+    width = max(len(r) for r in norm_rows)
+    norm_rows = [r + [""] * (width - len(r)) for r in norm_rows]
+    header = norm_rows[0]
+    out = ["| " + " | ".join(header) + " |", "| " + " | ".join(["---"] * width) + " |"]
+    for row in norm_rows[1:]:
+        out.append("| " + " | ".join(row) + " |")
+    return "\n".join(out)
+
+
+def _page_text_with_tables(page: Any) -> str:
+    """Текст страницы, где таблицы заменены Markdown-представлением.
+
+    Плоский get_text() в таблицах склеивает значения пробелами, заголовки
+    оторваны от строк — LLM угадывает «модель→колонка→значение» и ошибается на
+    широких таблицах. find_tables() распознаёт сетку, и мы подаём её как Markdown.
+    Нетабличный текст сохраняется в исходном вертикальном порядке. При любой
+    ошибке — фолбэк на плоский sorted-текст (надёжность важнее)."""
+    try:
+        tables_finder = page.find_tables()
+        tables = list(tables_finder.tables)
+    except Exception:
+        return page.get_text("text", sort=True)
+
+    if not tables:
+        return page.get_text("text", sort=True)
+
+    table_bboxes = []
+    table_segments = []  # (y0, markdown)
+    for table in tables:
+        try:
+            rows = table.extract()
+            md = _serialize_table_markdown(rows)
+            bbox = fitz.Rect(table.bbox)
+        except Exception:
+            continue
+        if md:
+            table_bboxes.append(bbox)
+            table_segments.append((float(bbox.y0), md))
+
+    if not table_segments:
+        return page.get_text("text", sort=True)
+
+    # Текстовые блоки вне областей таблиц (чтобы не дублировать табличный текст).
+    text_segments = []  # (y0, text)
+    try:
+        blocks = page.get_text("blocks", sort=True)
+    except Exception:
+        blocks = []
+    for block in blocks:
+        if len(block) < 5:
+            continue
+        x0, y0, x1, y1, btext = block[0], block[1], block[2], block[3], block[4]
+        if not isinstance(btext, str) or not btext.strip():
+            continue
+        block_rect = fitz.Rect(x0, y0, x1, y1)
+        # Пропускаем блоки, существенно пересекающиеся с любой таблицей.
+        inside_table = False
+        for tb in table_bboxes:
+            inter = block_rect & tb
+            if inter.is_valid and inter.get_area() > 0.5 * block_rect.get_area():
+                inside_table = True
+                break
+        if not inside_table:
+            text_segments.append((float(y0), btext.strip()))
+
+    # Собираем в вертикальном порядке: текстовые блоки и таблицы вперемешку по Y.
+    combined = sorted(text_segments + table_segments, key=lambda s: s[0])
+    parts = [seg[1] for seg in combined]
+    result = "\n".join(parts).strip()
+    return result or page.get_text("text", sort=True)
+
+
 def _convert_pdf_to_structured_text(
     local_path: str,
     target_names: list[str] | None = None,
@@ -458,7 +574,9 @@ def _convert_pdf_to_structured_text(
     all_pages_text: list[str] = []
     for i in range(page_count):
         page = document.load_page(i)
-        text = page.get_text("text", sort=True).strip()
+        # Таблицы подаём как Markdown (явная привязка значение→столбец), остальной
+        # текст — как обычно. На сканах/OCR ветка ниже не затрагивается.
+        text = _page_text_with_tables(page).strip()
         all_pages_text.append(text)
 
     combined_text = "\n".join(t for t in all_pages_text if t)
