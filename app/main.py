@@ -1123,6 +1123,46 @@ def _collect_value_context(node: dict[str, Any]) -> list[str]:
     return context_values
 
 
+def _looks_like_markdown_table_row(text: str) -> bool:
+    """True, если строка похожа на ячейки Markdown-таблицы (есть разделители «|»).
+    LLM теперь получает таблицы как Markdown (см. _page_text_with_tables), поэтому
+    quote_text характеристики из таблицы — это строка вида 'модель | v1 | v2 | ...'.
+    В реальном тексте PDF символов «|» нет, и точный поиск такой цитаты проваливался
+    → геометрия привязывалась к заголовку. Поэтому такие цитаты разбираем на ячейки."""
+    return text.count("|") >= 2
+
+
+def _markdown_row_cell_candidates(
+    text: str, page_hint: int | None
+) -> list[dict[str, Any]]:
+    """Из Markdown-строки таблицы делает кандидаты для геометрии: код модели (первая
+    значимая ячейка), отдельные значения-ячейки и очищенный текст без «|».
+    Markdown-разделители «| --- |» игнорируются."""
+    cells = [c.strip() for c in text.split("|")]
+    cells = [c for c in cells if c and not re.fullmatch(r"[-:\s]+", c)]
+    if not cells:
+        return []
+    out: list[dict[str, Any]] = []
+    # Первая ячейка — обычно код модели / название строки: ценный якорь.
+    out.append({
+        "text": cells[0], "kind": "anchor_text", "weight": 0.9, "page_hint": page_hint,
+    })
+    # Остальные ячейки — значения; короткие числа ambiguous, но в паре с моделью
+    # дают точную привязку строки.
+    for cell in cells[1:]:
+        if len(cell) >= 2:
+            out.append({
+                "text": cell, "kind": "value", "weight": 0.75, "page_hint": page_hint,
+            })
+    # Очищенная строка целиком (числа через пробел) — иногда совпадает с PDF-строкой.
+    cleaned = " ".join(cells)
+    if cleaned and cleaned != text:
+        out.append({
+            "text": cleaned, "kind": "text", "weight": 0.7, "page_hint": page_hint,
+        })
+    return out
+
+
 def _collect_reference_candidates(
     reference: Any,
     *,
@@ -1144,6 +1184,14 @@ def _collect_reference_candidates(
                 # позиционировать конкретную характеристику — иначе все они сядут
                 # в одно место (заголовок на стр. 1).
                 if key in {"anchor_text", "locator_text"} and _normalize_match_text(value) in generic_anchors:
+                    continue
+                # Markdown-строка таблицы: «|» в реальном PDF нет — разбираем на ячейки
+                # (код модели + значения), иначе точный поиск цитаты провалится и
+                # геометрия привяжется к заголовку таблицы.
+                if key == "quote_text" and _looks_like_markdown_table_row(value):
+                    raw_candidates.extend(
+                        _markdown_row_cell_candidates(value, page_hint)
+                    )
                     continue
                 raw_candidates.append(
                     {
