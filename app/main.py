@@ -470,24 +470,81 @@ def _augment_sparse_pages_with_ocr(
     return updated, replaced
 
 
+def _cell_is_numeric(value: str) -> bool:
+    """Ячейка — числовое значение (а не подпись): после удаления единиц/скобок
+    осталось в основном число."""
+    s = value.strip()
+    if not s:
+        return False
+    return bool(re.fullmatch(r"[\d.,()\s/x×*+\-±]+", s))
+
+
 def _serialize_table_markdown(rows: list[list[Any]]) -> str:
-    """Сериализует таблицу (список строк-списков от find_tables().extract()) в
-    Markdown. Первая строка — заголовок. Пустые ячейки (None) → ''; переводы строк
-    внутри ячеек → пробел. Markdown даёт модели явную привязку
-    «значение → столбец», убирая угадывание по пробелам в плоском тексте."""
+    """Сериализует таблицу (от find_tables().extract()) в Markdown.
+
+    Многоуровневые заголовки СХЛОПЫВАЮТСЯ в один: верхний уровень растягивается
+    на «протянутые» (None) ячейки справа, затем уровни склеиваются по столбцам.
+    Пример: ('Подача', None, 'Напор') + ('м3/ч', 'л/с', 'м') →
+    'Подача, м3/ч | Подача, л/с | Напор, м'. Иначе LLM путает подколонки
+    (брал л/с вместо напора). Пустые ячейки (None) → ''; '|' внутри → '/'."""
     def _cell(value: Any) -> str:
         text = "" if value is None else str(value)
         return re.sub(r"\s+", " ", text).replace("|", "/").strip()
 
-    norm_rows = [[_cell(c) for c in row] for row in rows if row]
-    if not norm_rows:
+    raw = [row for row in rows if row]
+    if not raw:
         return ""
-    width = max(len(r) for r in norm_rows)
-    norm_rows = [r + [""] * (width - len(r)) for r in norm_rows]
-    header = norm_rows[0]
-    out = ["| " + " | ".join(header) + " |", "| " + " | ".join(["---"] * width) + " |"]
-    for row in norm_rows[1:]:
-        out.append("| " + " | ".join(row) + " |")
+    width = max(len(r) for r in raw)
+    raw = [list(r) + [None] * (width - len(r)) for r in raw]
+
+    # Сколько верхних строк — заголовки: строка-заголовок почти не содержит
+    # числовых ячеек (это подписи колонок/единицы). Максимум 2 уровня.
+    def _is_header_row(row: list[Any]) -> bool:
+        cells = [_cell(c) for c in row if _cell(c)]
+        if not cells:
+            return True  # пустая «протяжка» — часть шапки
+        numeric = sum(1 for c in cells if _cell_is_numeric(c))
+        return numeric <= max(0, len(cells) // 3)
+
+    # Первая строка — всегда заголовок. Вторая считается ВТОРЫМ уровнем шапки
+    # только если она похожа на под-заголовки (мало чисел) И её первая ячейка
+    # пустая — т.е. под колонкой-ключом («Типоразмер») нет под-подписи. Иначе это
+    # уже строка данных (на стр.5 первая «ячейка» второго ряда = коды моделей).
+    header_depth = 1
+    if len(raw) >= 2 and _is_header_row(raw[1]) and not _cell(raw[1][0]):
+        header_depth = 2
+
+    # «Протягиваем» верхний уровень вправо по None-ячейкам (объединённые шапки).
+    header_levels: list[list[str]] = []
+    for level in raw[:header_depth]:
+        filled: list[str] = []
+        last = ""
+        for c in level:
+            txt = _cell(c)
+            if txt:
+                last = txt
+                filled.append(txt)
+            else:
+                # None в исходнике = продолжение объединённой ячейки слева.
+                filled.append(last if c is None else "")
+        header_levels.append(filled)
+
+    # Склеиваем уровни по столбцам, убирая дубли (если уровни совпали).
+    merged_header: list[str] = []
+    for col in range(width):
+        parts: list[str] = []
+        for lvl in header_levels:
+            val = lvl[col] if col < len(lvl) else ""
+            if val and val not in parts:
+                parts.append(val)
+        merged_header.append(", ".join(parts))
+
+    out = [
+        "| " + " | ".join(merged_header) + " |",
+        "| " + " | ".join(["---"] * width) + " |",
+    ]
+    for row in raw[header_depth:]:
+        out.append("| " + " | ".join(_cell(c) for c in row) + " |")
     return "\n".join(out)
 
 
