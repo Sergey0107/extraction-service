@@ -19,6 +19,14 @@ except ImportError:
     PYMUPDF_INSTALLED = False
 
 try:
+    import pdfplumber
+
+    PDFPLUMBER_INSTALLED = True
+except ImportError:
+    pdfplumber = None
+    PDFPLUMBER_INSTALLED = False
+
+try:
     from docling.datamodel.base_models import InputFormat
     from docling.datamodel.pipeline_options import VlmConvertOptions, VlmPipelineOptions
     from docling.datamodel.vlm_engine_options import ApiVlmEngineOptions, VlmEngineType
@@ -108,7 +116,11 @@ OPENROUTER_API_KEY = get_env("OPENROUTER_API_KEY")
 OPENROUTER_MODEL = get_env("OPENROUTER_MODEL", "openai/gpt-4.1")
 OPENROUTER_BASE_URL = get_env("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
 OPENROUTER_PDF_ENGINE = get_env("OPENROUTER_PDF_ENGINE", "mistral-ocr")
-OPENROUTER_MAX_TOKENS = min(get_int_env("OPENROUTER_MAX_TOKENS", 4000), 8000)
+# Потолок 16000: паспорта с большими таблицами (габариты L/H/W/a..e для многих
+# моделей) через MinerU дают много характеристик + длинные quote_text строк
+# таблиц. При 8000 ответ обрезался (finish_reason=length) → «Unterminated JSON»
+# → весь passport-extract падал. gpt-4.1 поддерживает существенно больший output.
+OPENROUTER_MAX_TOKENS = min(get_int_env("OPENROUTER_MAX_TOKENS", 8000), 16000)
 OPENROUTER_APP_NAME = get_env("OPENROUTER_APP_NAME", "extraction-service")
 OPENROUTER_SITE_URL = get_env("OPENROUTER_SITE_URL", "http://localhost:8005")
 OPENROUTER_PROVIDER_ORDER = get_list_env("OPENROUTER_PROVIDER_ORDER")
@@ -127,8 +139,37 @@ LLAMAPARSE_LANGUAGE = get_env("LLAMAPARSE_LANGUAGE", "ru")
 LLAMAPARSE_REQUEST_TIMEOUT_SECONDS = get_int_env("LLAMAPARSE_REQUEST_TIMEOUT_SECONDS", 120)
 LLAMAPARSE_MAX_RETRIES = get_int_env("LLAMAPARSE_MAX_RETRIES", 2)
 
-SUPPORTED_BACKENDS = {"docling_local", "docling_remote", "openrouter", "llamaparse"}
+# --- MinerU cloud backend (mineru.net) -------------------------------------
+# ВНИМАНИЕ: mineru отправляет исходный документ на внешний (китайский) сервер
+# (загрузка идёт на oss-cn-shanghai.aliyuncs.com). Не включать для
+# конфиденциальных документов без согласования.
+MINERU_ENABLED = get_env("MINERU_ENABLED", "0") == "1"
+MINERU_TOKEN = get_env("MINERU_TOKEN")
+MINERU_API_BASE = get_env("MINERU_API_BASE", "https://mineru.net/api/v4")
+MINERU_LANGUAGE = get_env("MINERU_LANGUAGE", "cyrillic")
+MINERU_MODEL_VERSION = get_env("MINERU_MODEL_VERSION", "vlm")
+MINERU_POLL_TIMEOUT = get_int_env("MINERU_POLL_TIMEOUT", 300)
+MINERU_POLL_INTERVAL = get_int_env("MINERU_POLL_INTERVAL", 5)
+MINERU_PAGE_RANGES = get_env("MINERU_PAGE_RANGES")  # напр. "5,7,14" — может игнорироваться API
+
+# --- VLM-гибрид для openrouter-бэкенда -------------------------------------
+# Страницы с таблицами дополнительно отдаются в gpt-4.1 как изображение (vision),
+# чтобы модель читала значения по картинке (устойчивее к сложным шапкам таблиц).
+VISION_TABLES_ENABLED = get_env("VISION_TABLES_ENABLED", "0") == "1"
+VISION_MODEL = get_env("VISION_MODEL", OPENROUTER_MODEL) or OPENROUTER_MODEL
+VISION_DPI = get_int_env("VISION_DPI", 200)
+VISION_MAX_TABLE_PAGES = get_int_env("VISION_MAX_TABLE_PAGES", 8)
+
+SUPPORTED_BACKENDS = {
+    "docling_local", "docling_remote", "openrouter", "llamaparse", "mineru", "pdfplumber",
+}
 ACTIVE_BACKENDS = {"openrouter", "llamaparse"}
+# mineru активен только при наличии токена и явном включении.
+if MINERU_ENABLED and MINERU_TOKEN:
+    ACTIVE_BACKENDS = ACTIVE_BACKENDS | {"mineru"}
+# pdfplumber не требует внешних сервисов/токенов — активен, если пакет установлен.
+if PDFPLUMBER_INSTALLED:
+    ACTIVE_BACKENDS = ACTIVE_BACKENDS | {"pdfplumber"}
 STUBBED_BACKENDS = SUPPORTED_BACKENDS - ACTIVE_BACKENDS
 if EXTRACTION_BACKEND not in ACTIVE_BACKENDS:
     logger.warning(

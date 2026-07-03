@@ -45,6 +45,14 @@ from app.config import (
     LLAMAPARSE_REQUEST_TIMEOUT_SECONDS,
     LLAMAPARSE_RESULT_TYPE,
     LLM_IS_YANDEX,
+    MINERU_API_BASE,
+    MINERU_ENABLED,
+    MINERU_LANGUAGE,
+    MINERU_MODEL_VERSION,
+    MINERU_PAGE_RANGES,
+    MINERU_POLL_INTERVAL,
+    MINERU_POLL_TIMEOUT,
+    MINERU_TOKEN,
     OPENROUTER_API_KEY,
     OPENROUTER_APP_NAME,
     OPENROUTER_BASE_URL,
@@ -54,14 +62,22 @@ from app.config import (
     OPENROUTER_PROVIDER_IGNORE,
     OPENROUTER_PROVIDER_ORDER,
     OPENROUTER_SITE_URL,
+    PDFPLUMBER_INSTALLED,
     PYMUPDF_INSTALLED,
     REMOTE_API_TIMEOUT_SECONDS,
     STUBBED_BACKENDS,
     SUPPORTED_BACKENDS,
+    VISION_DPI,
+    VISION_MAX_TABLE_PAGES,
+    VISION_MODEL,
+    VISION_TABLES_ENABLED,
     fitz,
     logger,
 )
+from app.mineru_client import MineruError, extract_tables_mineru
 from app.models import DownloadedFile, ExtractionRequest, PdfPageIndex, PdfWord
+from app.pdfplumber_extractor import build_llm_payload as build_pdfplumber_llm_payload
+from app.pdfplumber_extractor import extract_pdf_geometry
 from app.schema_utils import normalize_json_schema
 
 
@@ -103,6 +119,9 @@ async def health() -> dict:
         "pymupdf_installed": PYMUPDF_INSTALLED,
         "geometry_enrichment_enabled": GEOMETRY_ENRICHMENT_ENABLED,
         "llamaparse_configured": bool(LLAMAPARSE_API_KEY),
+        "mineru_configured": bool(MINERU_ENABLED and MINERU_TOKEN),
+        "vision_hybrid_enabled": VISION_TABLES_ENABLED,
+        "pdfplumber_installed": PDFPLUMBER_INSTALLED,
     }
 
 
@@ -370,6 +389,61 @@ def _page_continues_table(text: str) -> bool:
     stripped = text.lstrip()
     starts_with_row = stripped.startswith("|")
     return starts_with_row and not _page_has_table(text)
+
+
+def _render_table_pages_to_images(
+    local_path: str,
+    *,
+    dpi: int = 200,
+    max_pages: int = 8,
+) -> list[dict[str, Any]]:
+    """Рендерит страницы PDF, содержащие таблицы, в base64-PNG для vision-модели.
+
+    Отбирает страницы, где PyMuPDF находит таблицы, ранжирует по «табличной
+    плотности» (число ячеек) и берёт не более ``max_pages`` самых насыщенных.
+    Возвращает список content-частей вида {type:image_url, image_url:{url:data...},
+    page_number:N} для добавления в user-message. При любой ошибке — пустой список
+    (гибрид деградирует к текстовому пути)."""
+    if not PYMUPDF_INSTALLED or fitz is None:
+        return []
+    try:
+        doc = fitz.open(local_path)
+    except Exception:  # noqa: BLE001
+        logger.warning("vision-hybrid: cannot open PDF %s", local_path)
+        return []
+    scored: list[tuple[int, int]] = []  # (cell_count, page_index)
+    try:
+        for i in range(doc.page_count):
+            try:
+                tables = doc.load_page(i).find_tables().tables
+            except Exception:  # noqa: BLE001
+                continue
+            cells = 0
+            for t in tables:
+                try:
+                    cells += len(t.rows) * len(t.header.names or [])
+                except Exception:  # noqa: BLE001
+                    cells += 1
+            if cells > 0:
+                scored.append((cells, i))
+        scored.sort(reverse=True)
+        selected = sorted(idx for _, idx in scored[:max_pages])
+        parts: list[dict[str, Any]] = []
+        mat = fitz.Matrix(dpi / 72, dpi / 72)
+        for idx in selected:
+            pix = doc.load_page(idx).get_pixmap(matrix=mat, alpha=False)
+            b64 = base64.b64encode(pix.tobytes("png")).decode("ascii")
+            parts.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:image/png;base64,{b64}"},
+                "page_number": idx + 1,
+            })
+        return parts
+    except Exception:  # noqa: BLE001
+        logger.exception("vision-hybrid: rendering table pages failed")
+        return []
+    finally:
+        doc.close()
 
 
 def _filter_relevant_pages(
@@ -1383,6 +1457,33 @@ def _build_pdf_page_index(local_path: str) -> tuple[Any, list[PdfPageIndex]]:
     return document, pages
 
 
+def _build_single_page_index(document: Any, page_number: int) -> PdfPageIndex | None:
+    """Строит индекс слов ОДНОЙ страницы (1-based) по текстовому слою.
+
+    Быстрая точечная альтернатива _build_pdf_page_index для гибрида MinerU: нам
+    нужны координаты слов лишь на страницах, где MinerU нашёл таблицы, а не по
+    всему документу. Возвращает None, если на странице нет текстового слоя."""
+    idx = page_number - 1
+    if idx < 0 or idx >= document.page_count:
+        return None
+    page = document.load_page(idx)
+    raw_words = page.get_text("words", sort=True)
+    words: list[PdfWord] = []
+    for raw_word in raw_words:
+        text = str(raw_word[4]).strip()
+        normalized = _normalize_match_text(text)
+        if not normalized:
+            continue
+        words.append(
+            PdfWord(
+                text=text,
+                normalized=normalized,
+                rect=fitz.Rect(raw_word[0], raw_word[1], raw_word[2], raw_word[3]),
+            )
+        )
+    if not words:
+        return None
+    return PdfPageIndex(page_number=page_number, page=page, words=words)
 
 
 def _build_pdf_page_index_ocr(local_path: str) -> tuple[Any, list[PdfPageIndex]]:
@@ -3359,6 +3460,986 @@ async def _extract_via_llamaparse(payload: ExtractionRequest) -> dict[str, Any]:
     })
 
 
+def _mineru_layout_blocks(layout: Any) -> list[dict[str, Any]]:
+    """Разворачивает layout.json MinerU в плоский список блоков с геометрией.
+
+    Возвращает список {page_idx, page_size:[w,h], bbox:[x0,y0,x1,y1], text},
+    где text — нормализованный текст блока (для таблиц — извлечённый из HTML).
+    bbox уже в координатах page_size (в отличие от content_list, где иная шкала)."""
+    blocks: list[dict[str, Any]] = []
+    if not isinstance(layout, dict):
+        return blocks
+    pdf_info = layout.get("pdf_info")
+    if not isinstance(pdf_info, list):
+        return blocks
+    for page in pdf_info:
+        if not isinstance(page, dict):
+            continue
+        page_idx = page.get("page_idx")
+        page_size = page.get("page_size")
+        if not (isinstance(page_size, (list, tuple)) and len(page_size) == 2):
+            continue
+        para_blocks = page.get("para_blocks") or page.get("preproc_blocks") or []
+        for blk in para_blocks:
+            if not isinstance(blk, dict):
+                continue
+            bbox = blk.get("bbox")
+            if not (isinstance(bbox, (list, tuple)) and len(bbox) == 4):
+                continue
+            text = _mineru_block_text(blk)
+            blocks.append({
+                "page_idx": page_idx,
+                "page_size": [float(page_size[0]), float(page_size[1])],
+                "bbox": [float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])],
+                "text": text,
+            })
+    return blocks
+
+
+def _mineru_block_text(blk: dict[str, Any]) -> str:
+    """Собирает весь текст блока layout (включая HTML таблиц) в одну строку."""
+    parts: list[str] = []
+
+    def walk(node: Any) -> None:
+        if isinstance(node, dict):
+            for key in ("html", "content", "text"):
+                v = node.get(key)
+                if isinstance(v, str) and v.strip():
+                    parts.append(v)
+            for v in node.values():
+                if isinstance(v, (list, dict)):
+                    walk(v)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+
+    walk(blk)
+    joined = " ".join(parts)
+    # вычищаем HTML-теги, чтобы матчить по тексту
+    return re.sub(r"<[^>]+>", " ", joined)
+
+
+def _split_table_row_cells(quote: str | None) -> list[str]:
+    """Разбивает строку-ряд таблицы на ячейки. MinerU/LLM непоследовательны в
+    разделителе: иногда Markdown-пайпы ('| a | b |'), иногда табуляция ('a\\tb').
+    Поддерживаем оба."""
+    if not quote:
+        return []
+    s = str(quote)
+    if "|" in s:
+        cells = s.split("|")
+    elif "\t" in s:
+        cells = s.split("\t")
+    else:
+        return []
+    cells = [c.strip() for c in cells]
+    return [c for c in cells if c and not re.fullmatch(r"[-:\s]+", c)]
+
+
+def _model_code_from_markdown_quote(quote: str | None) -> str | None:
+    """Извлекает код модели из строки-ряда таблицы: первая непустая ячейка.
+
+    LLM для табличных характеристик кладёт в quote_text ВСЮ строку таблицы
+    ('| XM 0,25/1,2П-0,06 | 0,25 | ...' или через табы). Первая ячейка — код
+    модели, надёжный якорь строки. None, если quote не похож на ряд таблицы."""
+    cells = _split_table_row_cells(quote)
+    if not cells:
+        return None
+    first = cells[0]
+    # первая ячейка должна выглядеть как код модели (буквы+цифры), а не число-значение.
+    if re.search(r"[A-Za-zА-Яа-я]", first) and re.search(r"\d", first):
+        return first
+    return None
+
+
+_MEASURE_UNITS = (
+    "мм", "см", "м3/час", "м3/ч", "м³/час", "м³/ч", "л/с", "об/мин", "квт", "вт",
+    "кг", "г", "гц", "в", "а", "бар", "мпа", "°c", "м.в.ст", "м", "%",
+)
+
+
+def _value_core_for_cell_search(value: Any) -> str:
+    """Готовит значение характеристики к поиску ячейки: аккуратно убирает единицы.
+
+    LLM возвращает value по-разному: '6,0 Вт', '150x90x100 мм', 'G1', 'G3/4',
+    '14/14 мм', 'Резьбовое'. В таблице ячейка — без единиц. НЕЛЬЗЯ грубо тянуть
+    первое число ('G1' → '1' сломает поиск). Логика по приоритету:
+      1) размер AxBxC → как есть без пробелов;
+      2) '<токен> <единица>' → снять только хвост-единицу (по пробелу);
+      3) иначе — вернуть значение как есть (для 'G1', 'G3/4' и т.п.)."""
+    if value is None:
+        return ""
+    s = str(value).strip()
+    if not s:
+        return ""
+    # 1) размер вида 150x90x100 / 150х90х100 (лат./кир. x)
+    m = re.search(r"\d+(?:[.,]\d+)?\s*[xх*]\s*\d+(?:[.,]\d+)?(?:\s*[xх*]\s*\d+(?:[.,]\d+)?)?", s)
+    if m:
+        return re.sub(r"\s+", "", m.group(0))
+    # 2) хвост-единица, отделённая пробелом: '6,0 Вт' → '6,0', '180,0 Вт' → '180,0'
+    parts = s.split()
+    if len(parts) >= 2 and parts[-1].lower().strip(".,") in _MEASURE_UNITS:
+        core = " ".join(parts[:-1]).strip()
+        if core:
+            return core
+    # 3) как есть (G1, G3/4, 14/14, Резьбовое — ищем дословно)
+    return s
+
+
+def _model_rects_by_anchor_tokens(
+    page_index: PdfPageIndex,
+    context_terms: list[str],
+    inside_fn,
+) -> list[Any]:
+    """Строки кода модели по прямому совпадению слов с anchor (код модели).
+
+    Для форматов без числового ядра AAA-BBB (напр. 'ХМ 3,2/4Т-0,18-G1') ищем
+    слово таблицы, чей нормализованный текст сильно пересекается с anchor —
+    например слово '3,2/4Т-0,18-G1' покрывает большую часть кода модели."""
+    # берём самые длинные/специфичные термы (код модели, а не короткие названия)
+    anchor_norms = [
+        _normalize_match_text(t) for t in context_terms if t and len(str(t)) >= 5
+    ]
+    anchor_norms = [a for a in anchor_norms if a]
+    if not anchor_norms:
+        return []
+    rects: list[Any] = []
+    for word in page_index.words:
+        if not inside_fn(word.rect):
+            continue
+        wn = word.normalized
+        if len(wn) < 4:
+            continue
+        for anchor in anchor_norms:
+            # слово таблицы — подстрока anchor (частичный код модели) или наоборот,
+            # и достаточно длинное, чтобы не ловить случайные короткие токены.
+            if (wn in anchor and len(wn) >= 6) or (anchor in wn and len(anchor) >= 6):
+                rects.append(word.rect)
+                break
+            ratio = _token_overlap_ratio(anchor, wn)
+            if ratio >= 0.6 and len(wn) >= 6:
+                rects.append(word.rect)
+                break
+    return rects
+
+
+def _locate_value_in_table_bbox(
+    page_index: PdfPageIndex,
+    table_bbox_norm: tuple[float, float, float, float],
+    value_text: str,
+    context_terms: list[str],
+) -> Any | None:
+    """Находит ячейку значения ВНУТРИ bbox таблицы (нормализованного) на странице.
+
+    MinerU знает bbox таблицы, откуда взято значение. Ищем слово == value внутри
+    этого bbox, лежащее на СТРОКЕ кода модели (та же горизонталь). Это точная
+    ячейка нужной строки — без поиска по всему документу и без привязки к
+    названию характеристики (которое может не совпадать с заголовком столбца)."""
+    page_rect = _page_index_rect(page_index)
+    pw, ph = float(page_rect.width), float(page_rect.height)
+    if pw <= 0 or ph <= 0:
+        return None
+    tx0, ty0, tx1, ty1 = table_bbox_norm
+    # абсолютные границы таблицы (с небольшим запасом на неточность bbox)
+    ax0, ay0 = tx0 * pw - 4, ty0 * ph - 4
+    ax1, ay1 = tx1 * pw + 4, ty1 * ph + 4
+
+    def _inside(r: Any) -> bool:
+        cx = (float(r.x0) + float(r.x1)) / 2
+        cy = (float(r.y0) + float(r.y1)) / 2
+        return ax0 <= cx <= ax1 and ay0 <= cy <= ay1
+
+    # Унифицируем разделитель размеров: в PDF габариты пишут кириллической 'х'
+    # (340х245х205), а LLM часто возвращает латинскую 'x' (340x245x205) — без
+    # приведения слово != значение. Обе 'x/х' и '*' → общий маркер.
+    def _unify(s: str) -> str:
+        return re.sub(r"[xх*]", "x", _normalize_match_text(s))
+
+    norm_value = _unify(value_text)
+    if not norm_value:
+        return None
+    # слова-значения внутри таблицы (с унификацией разделителя размеров)
+    value_cells = [
+        w.rect for w in page_index.words
+        if _unify(w.text) == norm_value and _inside(w.rect)
+    ]
+    if not value_cells:
+        return None
+    # строки кода модели внутри таблицы: сначала штатный поиск по числовому ядру,
+    # затем — по прямому совпадению слова с кодом модели из anchor (форматы вроде
+    # 'ХМ 3,2/4Т-0,18-G1', где числового ядра AAA-BBB нет).
+    model_rects = [
+        mr for mr in _model_rects_from_words(page_index, context_terms) if _inside(mr)
+    ]
+    if not model_rects:
+        model_rects = _model_rects_by_anchor_tokens(page_index, context_terms, _inside)
+    if not model_rects:
+        # без кода модели: если значение в таблице единственное — берём его,
+        # иначе неоднозначно — отказываемся (пусть отработает fallback на таблицу).
+        return value_cells[0] if len(value_cells) == 1 else None
+
+    model_h = max((float(mr.y1) - float(mr.y0) for mr in model_rects), default=12.0) or 12.0
+    y_tol = max(model_h * 0.8, 8.0)
+    best, best_d = None, float("inf")
+    for cell in value_cells:
+        cy = (float(cell.y0) + float(cell.y1)) / 2
+        for mr in model_rects:
+            y0, y1 = float(mr.y0) - y_tol, float(mr.y1) + y_tol
+            d = 0.0 if y0 <= cy <= y1 else min(abs(cy - y0), abs(cy - y1))
+            if d < best_d:
+                best_d, best = d, cell
+    return best if (best is not None and best_d <= y_tol) else None
+
+
+def _enrich_references_with_mineru_layout(
+    extracted_data: dict[str, Any],
+    layout: Any,
+    *,
+    local_path: str,
+    content_type: str | None,
+) -> dict[str, Any]:
+    """Гибридная геометрия для MinerU: layout определяет НУЖНУЮ таблицу/страницу,
+    PyMuPDF находит точную ЯЧЕЙКУ внутри.
+
+    MinerU надёжно знает, в какой таблице лежит значение (по HTML), но координат
+    ячейки не отдаёт (весь bbox — на всю таблицу). Поэтому: (1) по layout находим
+    таблицу и корректируем страницу reference; (2) PyMuPDF по этой странице ищет
+    точную строку/ячейку модель×столбец; (3) если PyMuPDF не смог — падаем на bbox
+    таблицы MinerU (грубее, но на нужной таблице)."""
+    metadata: dict[str, Any] = {
+        "enabled": True,
+        "provider": "mineru_layout",
+        "applied": False,
+        "page_count": 0,
+        "reference_count": 0,
+        "matched_reference_count": 0,
+        "page_corrections": 0,
+        "table_bbox_fallback": 0,
+        "errors": [],
+    }
+    blocks = _mineru_layout_blocks(layout)
+    if not blocks:
+        # MinerU не дал геометрии (напр. DOCX/текстовый TZ — только текст, без bbox).
+        # Сигнализируем вызывающему коду, что нужен PyMuPDF-энричмент (он умеет
+        # DOCX→PDF→координаты и текстовый поиск цитат).
+        metadata["errors"].append("no layout blocks")
+        metadata["needs_pymupdf_fallback"] = True
+        return metadata
+    metadata["page_count"] = len({b["page_idx"] for b in blocks if b["page_idx"] is not None})
+
+    _normalize_references_in_place(extracted_data)
+    generic_anchors = _collect_generic_anchor_texts(extracted_data)
+
+    # Шаг 1: по layout MinerU для каждой reference находим НУЖНЫЙ блок (таблицу),
+    # запоминаем его bbox и корректируем страницу reference.
+    # Для табличных references важно взять ПРАВИЛЬНЫЕ значение и код модели:
+    #  • значение — из ЗНАЧЕНИЯ характеристики (holder.value), а НЕ из reference
+    #    (в reference quote_text — целая Markdown-строка таблицы);
+    #  • код модели — первая ячейка Markdown-строки quote (если quote табличный),
+    #    т.к. anchor_text от LLM — это caption таблицы, не модель.
+    ref_info: list[dict[str, Any]] = []
+    pages_needed: set[int] = set()
+    for holder, references, ancestors in _reference_iter_with_ancestors(extracted_data):
+        label_context = _collect_label_context(holder)
+        value_context = _collect_value_context(holder)
+        ctx_terms = _collect_ancestor_context(ancestors) + label_context
+        holder_value = holder.get("value") if isinstance(holder, dict) else None
+        for reference in references:
+            if not isinstance(reference, dict):
+                continue
+            metadata["reference_count"] += 1
+            candidates = _collect_reference_candidates(
+                reference,
+                label_context=label_context,
+                value_context=value_context,
+                generic_anchors=generic_anchors,
+            )
+            best = _match_mineru_block(candidates, value_context, blocks, reference)
+            if not best:
+                continue
+            block = best["block"]
+            mineru_page = (block["page_idx"] or 0) + 1
+            if _safe_page_number(reference.get("page")) != mineru_page:
+                metadata["page_corrections"] += 1
+            reference["page"] = mineru_page
+            reference["page_number"] = mineru_page
+            # код модели из Markdown-строки quote (первая ячейка) — приоритетно
+            model_code = _model_code_from_markdown_quote(reference.get("quote_text"))
+            model_terms = [model_code] if model_code else []
+            model_terms += [reference.get("anchor_text") or ""]
+            model_terms += ctx_terms
+            ref_info.append({
+                "reference": reference,
+                "block": block,
+                "value": holder_value if holder_value is not None else reference.get("value"),
+                "model_terms": [t for t in model_terms if t],
+            })
+            pages_needed.add(mineru_page)
+
+    if not ref_info:
+        return metadata
+
+    # Шаг 2: строим PyMuPDF-индекс ТОЛЬКО нужных страниц (не всех 68 — быстро) и
+    # ищем точную ячейку значения ВНУТРИ bbox таблицы MinerU. Если ячейку не нашли
+    # (значение в тексте, не в таблице; или не распознано) — падаем на bbox таблицы.
+    page_index_cache: dict[int, PdfPageIndex | None] = {}
+    document = None
+    try:
+        if content_type and content_type.split(";", 1)[0].strip().lower() == "application/pdf" \
+                and PYMUPDF_INSTALLED and fitz is not None:
+            document = fitz.open(local_path)
+            for pno in pages_needed:
+                page_index_cache[pno] = _build_single_page_index(document, pno)
+
+        for info in ref_info:
+            reference = info["reference"]
+            block = info["block"]
+            page_no = (block["page_idx"] or 0) + 1
+            w, h = block["page_size"]
+            x0, y0, x1, y1 = block["bbox"]
+            table_norm = (
+                x0 / w if w else 0.0, y0 / h if h else 0.0,
+                x1 / w if w else 1.0, y1 / h if h else 1.0,
+            )
+            # значение характеристики без единиц («6,0 Вт» → «6,0», «150x90x100 мм» → «150x90x100»)
+            value_text = _value_core_for_cell_search(info.get("value"))
+            pi = page_index_cache.get(page_no)
+            cell_rect = None
+            if pi is not None and value_text:
+                cell_rect = _locate_value_in_table_bbox(
+                    pi, table_norm, value_text, info["model_terms"]
+                )
+
+            if cell_rect is not None:
+                reference["bbox"] = _rect_to_bbox(cell_rect, _page_index_rect(pi))
+                reference["locator_strategy"] = "mineru_cell"
+                reference["geometry_source"] = "mineru_cell"
+                reference["position_unverified"] = False
+                metadata["matched_reference_count"] += 1
+            else:
+                # fallback: bbox всей таблицы MinerU (грубее, но на нужной таблице)
+                reference["bbox"] = {
+                    "x": round(x0, 3), "y": round(y0, 3),
+                    "width": round(x1 - x0, 3), "height": round(y1 - y0, 3),
+                    "x0": round(x0, 3), "y0": round(y0, 3),
+                    "x1": round(x1, 3), "y1": round(y1, 3),
+                    "left": round(x0, 3), "top": round(y0, 3),
+                    "right": round(x1, 3), "bottom": round(y1, 3),
+                    "norm_x0": round(min(1.0, max(0.0, table_norm[0])), 6),
+                    "norm_y0": round(min(1.0, max(0.0, table_norm[1])), 6),
+                    "norm_x1": round(min(1.0, max(0.0, table_norm[2])), 6),
+                    "norm_y1": round(min(1.0, max(0.0, table_norm[3])), 6),
+                }
+                reference["locator_strategy"] = "mineru_table_bbox"
+                reference["geometry_source"] = "mineru_table_bbox"
+                reference["position_unverified"] = False
+                metadata["table_bbox_fallback"] += 1
+                metadata["matched_reference_count"] += 1
+    finally:
+        if document is not None:
+            try:
+                document.close()
+            except Exception:
+                pass
+
+    metadata["applied"] = metadata["matched_reference_count"] > 0
+    return metadata
+
+
+def _match_mineru_block(
+    candidates: list[dict[str, Any]],
+    value_context: list[str],
+    blocks: list[dict[str, Any]],
+    reference: dict[str, Any],
+) -> Optional[dict[str, Any]]:
+    """Находит блок layout, лучше всего соответствующий reference.
+
+    Скоринг: приоритет блокам, чей текст содержит и код модели (якорь), и
+    значение характеристики — так значение привязывается к нужной таблице, а не
+    к первой попавшейся. page_hint из reference повышает вес совпадений на той
+    же странице."""
+    # тексты-кандидаты якоря (код модели, цитата) и значения
+    anchor_texts = [
+        _normalize_match_text(c.get("text"))
+        for c in candidates
+        if c.get("text")
+    ]
+    anchor_texts = [t for t in anchor_texts if len(t) >= 3]
+    value_texts = [_normalize_match_text(v) for v in value_context if v and len(str(v)) >= 1]
+    value_texts = [t for t in value_texts if t]
+    page_hint = _safe_page_number(reference.get("page")) or _safe_page_number(
+        reference.get("page_number")
+    )
+    # Отдельные ячейки-значения из Markdown-строки quote. Когда одна и та же модель
+    # есть в нескольких таблицах (параметры vs габариты), правильную таблицу выдаёт
+    # именно совпадение ЯЧЕЕК ряда: '303','155','142' есть только в таблице габаритов.
+    row_cells: list[str] = []
+    for c in _split_table_row_cells(reference.get("quote_text")):
+        cn = _normalize_match_text(c)
+        # значимые ячейки: числа/размеры длиной >=2 (не одиночные цифры-шум)
+        if cn and len(cn) >= 2 and re.search(r"\d", cn):
+            row_cells.append(cn)
+
+    best: Optional[dict[str, Any]] = None
+    best_score = 0.0
+    best_area = float("inf")
+    best_page = float("inf")
+    for block in blocks:
+        norm_block = _normalize_match_text(block["text"])
+        if not norm_block:
+            continue
+        score = 0.0
+        anchor_hit = any(a in norm_block for a in anchor_texts)
+        value_hit = any(v in norm_block for v in value_texts) if value_texts else False
+        if anchor_hit:
+            score += 0.6
+        if value_hit:
+            score += 0.3
+        # доля ячеек ряда, реально присутствующих в блоке — отражает, что это ИМЕННО
+        # та таблица, откуда взят ряд (а не другая с тем же кодом модели).
+        if row_cells:
+            hit_cells = sum(1 for c in row_cells if c in norm_block)
+            score += 0.5 * (hit_cells / len(row_cells))
+        if not anchor_hit and not value_hit and not row_cells:
+            continue
+        if score < 0.3:
+            continue
+        # бонус за совпадение страницы-подсказки от LLM: указание страницы обычно
+        # надёжно, поэтому вес значимый — перевешивает совпадение по значению на
+        # другой странице (одно и то же значение встречается в разных таблицах).
+        if page_hint is not None and block["page_idx"] == page_hint - 1:
+            score += 0.35
+        x0, y0, x1, y1 = block["bbox"]
+        area = max(1.0, (x1 - x0) * (y1 - y0))
+        page = block["page_idx"] if block["page_idx"] is not None else 10**9
+        # При равном score предпочитаем компактный блок (точнее ячейки),
+        # при равной компактности — более раннюю страницу (детерминизм).
+        better = (
+            score > best_score
+            or (abs(score - best_score) < 1e-9 and area < best_area)
+            or (abs(score - best_score) < 1e-9 and abs(area - best_area) < 1e-9 and page < best_page)
+        )
+        if better:
+            best_score = score
+            best_area = area
+            best_page = page
+            best = {"block": block, "score": score}
+    return best
+
+
+async def _extract_via_mineru(payload: ExtractionRequest) -> dict[str, Any]:
+    """Извлечение через облачный MinerU (mineru.net).
+
+    MinerU меняет ТОЛЬКО источник таблиц: документ парсится в Markdown, где
+    таблицы представлены как HTML (<table> с rowspan/colspan) — это точнее
+    передаёт двухуровневые шапки, чем PyMuPDF. Дальше идёт тот же LLM-слой
+    структурного извлечения (gpt-4.1), что и в openrouter-бэкенде.
+
+    Геометрия/подсветка на этом этапе НЕ переписывается под MinerU-bbox:
+    references привязываются к странице (page-anchor) через существующий
+    PyMuPDF-энричмент по quote_text. Точный bbox из content_list.json —
+    отдельная задача (известное ограничение).
+    """
+    if not (MINERU_ENABLED and MINERU_TOKEN):
+        raise HTTPException(
+            status_code=501,
+            detail="Backend 'mineru' is disabled: set MINERU_ENABLED=1 and MINERU_TOKEN.",
+        )
+    if not OPENROUTER_API_KEY:
+        raise HTTPException(
+            status_code=500,
+            detail="OPENROUTER_API_KEY is not set (required for structured extraction after MinerU parsing)",
+        )
+    if not payload.prompt and not payload.schema_payload:
+        raise HTTPException(status_code=400, detail="schema or prompt is required")
+
+    schema = normalize_json_schema(payload.schema_payload, payload.prompt)
+    prompt = payload.prompt or "Extract structured data from the document and return JSON."
+    prompt = (
+        f"{prompt}\n"
+        "Таблицы ниже даны как HTML (<table> с rowspan/colspan). "
+        "Значение бери СТРОГО из ячейки на пересечении строки нужной модели и нужного столбца; "
+        "учитывай объединённые ячейки (rowspan/colspan) при определении, к каким строкам относится значение. "
+        "В quote_text помещай ТОЛЬКО код модели и искомое значение (напр. 'XM 3,2/4Т-0,18-G1 | 4,0'), "
+        "а НЕ всю строку таблицы со всеми столбцами — это раздувает ответ. "
+        "Верни результат строго как JSON schema response_format, без markdown и пояснений."
+    )
+
+    downloaded_file = await _download_file(payload.file_url)
+    started_at = time.monotonic()
+    markdown_text = ""
+    mineru_meta: dict[str, Any] = {}
+    mineru_layout: Any = None
+    geometry_metadata: dict[str, Any] = {
+        "enabled": GEOMETRY_ENRICHMENT_ENABLED,
+        "provider": "mineru_layout",
+        "applied": False,
+        "page_count": 1,
+        "errors": [],
+    }
+    try:
+        with open(downloaded_file.local_path, "rb") as fh:
+            pdf_bytes = fh.read()
+        mineru_result = await extract_tables_mineru(
+            pdf_bytes,
+            downloaded_file.filename,
+            token=MINERU_TOKEN,
+            api_base=MINERU_API_BASE,
+            language=MINERU_LANGUAGE,
+            model_version=MINERU_MODEL_VERSION,
+            page_ranges=MINERU_PAGE_RANGES,
+            timeout=MINERU_POLL_TIMEOUT,
+            interval=MINERU_POLL_INTERVAL,
+        )
+        markdown_text = mineru_result.markdown
+        mineru_layout = mineru_result.layout
+        mineru_meta = {
+            "batch_id": mineru_result.batch_id,
+            "page_count": mineru_result.page_count,
+            "layout_available": mineru_layout is not None,
+            **mineru_result.metadata,
+        }
+        logger.info(
+            "MinerU parsing finished in %.2fs, content length=%d",
+            time.monotonic() - started_at,
+            len(markdown_text),
+        )
+    except MineruError as exc:
+        logger.exception("MinerU parsing failed")
+        _cleanup_downloaded_file(downloaded_file)
+        raise HTTPException(status_code=502, detail=f"MinerU parsing failed: {exc}") from exc
+    except HTTPException:
+        _cleanup_downloaded_file(downloaded_file)
+        raise
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("MinerU parsing failed (unexpected)")
+        _cleanup_downloaded_file(downloaded_file)
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                f"MinerU parsing failed: {exc}\n\n"
+                f"Extraction service traceback:\n{traceback.format_exc()}"
+            ),
+        ) from exc
+
+    messages = _build_openrouter_messages_from_text(
+        prompt=prompt,
+        document_text=markdown_text,
+        filename=downloaded_file.filename,
+    )
+    payload_json: dict[str, Any] = {
+        "model": OPENROUTER_MODEL,
+        "messages": messages,
+        "temperature": 0,
+        "max_tokens": OPENROUTER_MAX_TOKENS,
+        "stream": False,
+        "response_format": _json_schema_response_format("mineru_extraction", schema),
+    }
+    provider_preferences = _build_openrouter_provider_preferences(require_parameters=True)
+    if provider_preferences:
+        payload_json["provider"] = provider_preferences
+
+    headers = _build_openai_headers(OPENROUTER_API_KEY)
+    if not LLM_IS_YANDEX:
+        headers["HTTP-Referer"] = OPENROUTER_SITE_URL or "http://localhost:8005"
+        headers["X-Title"] = OPENROUTER_APP_NAME or "extraction-service"
+
+    mineru_pdf_tmp: tempfile.TemporaryDirectory | None = None
+    try:
+        extracted_data, provider_response, used_fallback = await _chat_completion_json(
+            endpoint=f"{OPENROUTER_BASE_URL.rstrip('/')}/chat/completions",
+            headers=headers,
+            payload=payload_json,
+            provider_name="OpenRouter (mineru)",
+            repair_schema=schema,
+            repair_model=OPENROUTER_MODEL,
+        )
+        if used_fallback and _needs_schema_repair(extracted_data, schema):
+            extracted_data = await _repair_json_to_schema(
+                endpoint=f"{OPENROUTER_BASE_URL.rstrip('/')}/chat/completions",
+                headers=headers,
+                model=OPENROUTER_MODEL,
+                schema=schema,
+                candidate=extracted_data,
+                provider_name="OpenRouter schema repair (mineru)",
+            )
+        _normalize_references_in_place(extracted_data)
+        # Геометрия для PyMuPDF работает только по PDF. DOCX/Excel сначала
+        # конвертируем в PDF (как в openrouter-бэкенде), иначе координат не будет.
+        geom_local_path = downloaded_file.local_path
+        geom_content_type = downloaded_file.content_type
+        if _looks_like_docx(downloaded_file.filename, downloaded_file.content_type) or \
+                _looks_like_excel(downloaded_file.filename, downloaded_file.content_type):
+            try:
+                mineru_pdf_tmp = tempfile.TemporaryDirectory()
+                geom_local_path = await to_thread.run_sync(
+                    lambda: _convert_office_document_to_pdf(
+                        downloaded_file.local_path, mineru_pdf_tmp.name
+                    )
+                )
+                geom_content_type = "application/pdf"
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("MinerU: office→PDF for geometry failed: %s", exc)
+
+        if mineru_layout is not None:
+            # Гибрид: MinerU layout определяет таблицу/страницу, PyMuPDF — ячейку.
+            geometry_metadata = await to_thread.run_sync(
+                lambda: _enrich_references_with_mineru_layout(
+                    extracted_data,
+                    mineru_layout,
+                    local_path=geom_local_path,
+                    content_type=geom_content_type,
+                )
+            )
+            # MinerU не дал геометрии (DOCX/текстовый документ без bbox) —
+            # падаем на полный PyMuPDF-энричмент по цитатам.
+            if geometry_metadata.get("needs_pymupdf_fallback"):
+                logger.info("MinerU layout has no geometry; falling back to PyMuPDF")
+                geometry_metadata = await to_thread.run_sync(
+                    lambda: _enrich_references_with_pdf_geometry(
+                        extracted_data,
+                        local_path=geom_local_path,
+                        content_type=geom_content_type,
+                    )
+                )
+        else:
+            geometry_metadata = await to_thread.run_sync(
+                lambda: _enrich_references_with_pdf_geometry(
+                    extracted_data,
+                    local_path=geom_local_path,
+                    content_type=geom_content_type,
+                )
+            )
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("OpenRouter structured extraction failed (mineru)")
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                f"Structured extraction failed after MinerU: {exc}\n\n"
+                f"Extraction service traceback:\n{traceback.format_exc()}"
+            ),
+        ) from exc
+    finally:
+        _cleanup_downloaded_file(downloaded_file)
+        if mineru_pdf_tmp is not None:
+            mineru_pdf_tmp.cleanup()
+
+    elapsed = time.monotonic() - started_at
+    logger.info("MinerU full pipeline finished in %.2fs", elapsed)
+
+    return jsonable_encoder({
+        "analysis_id": payload.analysis_id,
+        "file_id": payload.file_id,
+        "file_type": payload.file_type,
+        "backend": "mineru",
+        "model_parse": "mineru",
+        "model_extract": OPENROUTER_MODEL,
+        "result": extracted_data,
+        "extraction": {"pages": [_build_result_page(extracted_data, raw_text=markdown_text)]},
+        "extraction_metadata": {
+            "docling_version": None,
+            "page_count": mineru_meta.get("page_count") or geometry_metadata.get("page_count"),
+            "errors": [],
+            "provider": "mineru+openrouter",
+            "provider_usage": provider_response.get("usage"),
+            "geometry": geometry_metadata,
+            "mineru": mineru_meta,
+            "docx_conversion": None,
+        },
+    })
+
+
+PDFPLUMBER_BBOX_PROMPT_RULES = (
+    "\n\nВАЖНО: ФОРМАТ ДОКУМЕНТА НИЖЕ — НЕ MARKDOWN. Если в инструкциях выше "
+    "упоминались Markdown-таблицы со строками '|' и разделителем '| --- |' — "
+    "это НЕ ПРИМЕНИМО к тексту ниже. Реальный формат другой (см. правила координат).\n\n"
+    "ПРАВИЛА ЧТЕНИЯ ДОКУМЕНТА И КООРДИНАТ (bbox):\n"
+    "Документ разбит на страницы ('=== СТРАНИЦА N ==='), внутри — на таблицы "
+    "('-- Таблица K --') и текст вне таблиц. Каждый фрагмент помечен точными "
+    'координатами в формате [bbox=[x0, top, x1, bottom]] "текст". Эти координаты '
+    "извлечены программно из PDF (через pdfplumber) — они АБСОЛЮТНО ТОЧНЫЕ.\n"
+    "• Внутри '-- Таблица K --' фрагменты идут по ЯЧЕЙКАМ строка за строкой — "
+    "каждая непустая ячейка таблицы (одна модель/типоразмер = одна строка) "
+    "выведена как отдельный [bbox=...] с текстом именно этой ячейки, а НЕ всей "
+    "строки и не всей таблицы. ТАБЛИЦА МОЖЕТ СОДЕРЖАТЬ МНОГО МОДЕЛЕЙ (много "
+    "строк) — извлекай характеристики КАЖДОЙ модели из таблицы, не только "
+    "первой попавшейся или той, что кажется 'главной'. Если пользователь явно "
+    "не указал конкретную модель — извлеки ВСЕ модели, представленные в таблице.\n"
+    "• Если под ячейкой таблицы дополнительно идут строки с пометкой "
+    "'(строка внутри ячейки выше)' — это значит сама ячейка МНОГОСТРОЧНАЯ "
+    "(содержит несколько характеристик, перечисленных через перенос строки, "
+    "как бывает в ТЗ: одна ячейка 'Характеристики Товара' содержит все "
+    "параметры сразу). В этом случае ВСЕГДА предпочитай bbox КОНКРЕТНОЙ "
+    "под-строки (более узкий, точно содержащий нужное значение), а НЕ bbox "
+    "всей ячейки целиком — иначе подсветка растянется на весь список "
+    "характеристик вместо одной.\n"
+    "ТЫ НИКОГДА НЕ ВЫЧИСЛЯЕШЬ И НЕ ПЕРЕСЧИТЫВАЕШЬ bbox. Для каждой reference "
+    "найди ближайший входной фрагмент [bbox=...] (по правилам выше — предпочитая "
+    "самый узкий/точный из подходящих), который буквально содержит нужное "
+    "значение (или код модели), и скопируй его bbox ПОБАЙТОВО в поле locator_text "
+    "в виде строки со следующим точным форматом (без пробелов, без лишних символов):\n"
+    "PDFPLUMBER_BBOX|<номер_страницы>|<x0>,<top>,<x1>,<bottom>\n"
+    "Например: PDFPLUMBER_BBOX|2|399.12,679.45,430.88,691.02\n"
+    "Числа x0/top/x1/bottom — скопированы дословно из входного [bbox=...], "
+    "БЕЗ округления, БЕЗ придумывания новых значений. Номер страницы — из "
+    "заголовка '=== СТРАНИЦА N ...' того блока, где найден фрагмент. "
+    "Если для характеристики нет точного совпадающего фрагмента в исходном "
+    "тексте — оставь locator_text пустым/null, НЕ придумывай координаты."
+)
+
+_PDFPLUMBER_BBOX_RE = re.compile(
+    r"^PDFPLUMBER_BBOX\|(\d+)\|(-?[\d.]+),(-?[\d.]+),(-?[\d.]+),(-?[\d.]+)\s*$"
+)
+
+
+def _apply_pdfplumber_bbox_copies(
+    extracted_data: dict[str, Any],
+    page_sizes: dict[int, tuple[float, float]],
+) -> dict[str, Any]:
+    """Постобработка ответа LLM для pdfplumber-бэкенда.
+
+    LLM НЕ ищет и не вычисляет координаты — она только скопировала строку
+    'PDFPLUMBER_BBOX|page|x0,top,x1,bottom' в locator_text (см. промпт). Здесь
+    мы её парсим, проверяем на вменяемость (число, страница существует, bbox
+    внутри границ страницы) и собираем стандартный bbox-объект. Если строка
+    отсутствует/невалидна — References остаётся БЕЗ bbox (position_unverified),
+    мы намеренно НЕ подключаем сюда эвристический поиск (в этом и есть чистота
+    подхода: либо bbox дословно скопирован, либо его нет)."""
+    metadata: dict[str, Any] = {
+        "enabled": True,
+        "provider": "pdfplumber",
+        "applied": False,
+        "reference_count": 0,
+        "matched_reference_count": 0,
+        "clipped_count": 0,
+        "errors": [],
+    }
+
+    _normalize_references_in_place(extracted_data)
+
+    for holder, references, _ancestors in _reference_iter_with_ancestors(extracted_data):
+        for index, reference in enumerate(references):
+            if isinstance(reference, str):
+                reference = {"quote_text": reference, "anchor_text": reference}
+                references[index] = reference
+            if not isinstance(reference, dict):
+                continue
+            metadata["reference_count"] += 1
+
+            raw = reference.get("locator_text")
+            match = _PDFPLUMBER_BBOX_RE.match(str(raw).strip()) if raw else None
+            if not match:
+                reference["position_unverified"] = True
+                continue
+
+            page_number = int(match.group(1))
+            x0, top, x1, bottom = (float(match.group(i)) for i in range(2, 6))
+            page_size = page_sizes.get(page_number)
+            if page_size is None:
+                reference["position_unverified"] = True
+                continue
+            w, h = page_size
+
+            clipped = False
+            nx0 = max(0.0, min(x0, w))
+            nx1 = max(0.0, min(x1, w))
+            ntop = max(0.0, min(top, h))
+            nbottom = max(0.0, min(bottom, h))
+            if (nx0, ntop, nx1, nbottom) != (x0, top, x1, bottom):
+                clipped = True
+            if nx1 <= nx0 or nbottom <= ntop:
+                reference["position_unverified"] = True
+                continue
+
+            reference["page"] = page_number
+            reference["page_number"] = page_number
+            reference["bbox"] = {
+                "x": round(nx0, 3), "y": round(ntop, 3),
+                "width": round(nx1 - nx0, 3), "height": round(nbottom - ntop, 3),
+                "x0": round(nx0, 3), "y0": round(ntop, 3),
+                "x1": round(nx1, 3), "y1": round(nbottom, 3),
+                "left": round(nx0, 3), "top": round(ntop, 3),
+                "right": round(nx1, 3), "bottom": round(nbottom, 3),
+                "norm_x0": round(min(1.0, max(0.0, nx0 / w)), 6) if w else 0.0,
+                "norm_y0": round(min(1.0, max(0.0, ntop / h)), 6) if h else 0.0,
+                "norm_x1": round(min(1.0, max(0.0, nx1 / w)), 6) if w else 1.0,
+                "norm_y1": round(min(1.0, max(0.0, nbottom / h)), 6) if h else 1.0,
+            }
+            reference["locator_strategy"] = "pdfplumber_llm_copy"
+            reference["geometry_source"] = "pdfplumber"
+            reference["position_unverified"] = False
+            metadata["matched_reference_count"] += 1
+            if clipped:
+                metadata["clipped_count"] += 1
+
+    metadata["applied"] = metadata["matched_reference_count"] > 0
+    return metadata
+
+
+async def _extract_via_pdfplumber(payload: ExtractionRequest) -> dict[str, Any]:
+    """Bbox-first геометрия: координаты ячеек вычисляются ГЕОМЕТРИЧЕСКИ через
+    pdfplumber (find_tables + within_bbox) ДО обращения к LLM. LLM получает уже
+    готовые пары «текст ↔ bbox» и только копирует нужный bbox дословно в ответ —
+    она не ищет и не вычисляет координаты постфактум.
+
+    Это принципиально отличается от openrouter/mineru: там LLM сначала
+    переформулирует значение характеристики в текст, а геометрия потом
+    эвристически ищет совпадение этого текста в PDF — что ломается на разнице
+    единиц измерения, кириллице/латинице, коротких неоднозначных значениях и
+    т.п. Здесь эвристики нет вообще: либо LLM скопировала верный bbox, либо
+    reference остаётся без координат (см. _apply_pdfplumber_bbox_copies).
+    """
+    if not PDFPLUMBER_INSTALLED:
+        raise HTTPException(
+            status_code=501,
+            detail="Backend 'pdfplumber' is disabled: pdfplumber package is not installed.",
+        )
+    if not OPENROUTER_API_KEY:
+        raise HTTPException(status_code=500, detail="OPENROUTER_API_KEY is not set")
+    if not payload.prompt and not payload.schema_payload:
+        raise HTTPException(status_code=400, detail="schema or prompt is required")
+
+    schema = normalize_json_schema(payload.schema_payload, payload.prompt)
+    prompt = payload.prompt or "Extract structured data from the document and return JSON."
+    prompt = (
+        f"{prompt}\n"
+        "Верни результат строго как JSON schema response_format. "
+        "Не добавляй markdown, пояснения или кодовые блоки."
+        f"{PDFPLUMBER_BBOX_PROMPT_RULES}"
+    )
+
+    downloaded_file = await _download_file(payload.file_url)
+    started_at = time.monotonic()
+    geometry_metadata: dict[str, Any] = {
+        "enabled": True,
+        "provider": "pdfplumber",
+        "applied": False,
+        "reference_count": 0,
+        "matched_reference_count": 0,
+        "errors": [],
+    }
+    pdfplumber_pdf_tmp: tempfile.TemporaryDirectory | None = None
+    try:
+        pdf_local_path = downloaded_file.local_path
+        if _looks_like_docx(downloaded_file.filename, downloaded_file.content_type) or \
+                _looks_like_excel(downloaded_file.filename, downloaded_file.content_type):
+            pdfplumber_pdf_tmp = tempfile.TemporaryDirectory()
+            pdf_local_path = await to_thread.run_sync(
+                lambda: _convert_office_document_to_pdf(
+                    downloaded_file.local_path, pdfplumber_pdf_tmp.name
+                )
+            )
+
+        pages = await to_thread.run_sync(lambda: extract_pdf_geometry(pdf_local_path))
+        document_text, truncated = build_pdfplumber_llm_payload(pages)
+        page_sizes = {p.page_number: (p.width, p.height) for p in pages}
+        logger.info(
+            "pdfplumber geometry extracted: %d pages, payload_len=%d, truncated=%s",
+            len(pages), len(document_text), truncated,
+        )
+    except HTTPException:
+        _cleanup_downloaded_file(downloaded_file)
+        if pdfplumber_pdf_tmp is not None:
+            pdfplumber_pdf_tmp.cleanup()
+        raise
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("pdfplumber geometry extraction failed")
+        _cleanup_downloaded_file(downloaded_file)
+        if pdfplumber_pdf_tmp is not None:
+            pdfplumber_pdf_tmp.cleanup()
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                f"pdfplumber extraction failed: {exc}\n\n"
+                f"Extraction service traceback:\n{traceback.format_exc()}"
+            ),
+        ) from exc
+
+    messages = _build_openrouter_messages_from_text(
+        prompt=prompt,
+        document_text=document_text,
+        filename=downloaded_file.filename,
+    )
+    payload_json: dict[str, Any] = {
+        "model": OPENROUTER_MODEL,
+        "messages": messages,
+        "temperature": 0,
+        "max_tokens": OPENROUTER_MAX_TOKENS,
+        "stream": False,
+        "response_format": _json_schema_response_format("pdfplumber_extraction", schema),
+    }
+    provider_preferences = _build_openrouter_provider_preferences(require_parameters=True)
+    if provider_preferences:
+        payload_json["provider"] = provider_preferences
+
+    headers = _build_openai_headers(OPENROUTER_API_KEY)
+    if not LLM_IS_YANDEX:
+        headers["HTTP-Referer"] = OPENROUTER_SITE_URL or "http://localhost:8005"
+        headers["X-Title"] = OPENROUTER_APP_NAME or "extraction-service"
+
+    try:
+        extracted_data, provider_response, used_fallback = await _chat_completion_json(
+            endpoint=f"{OPENROUTER_BASE_URL.rstrip('/')}/chat/completions",
+            headers=headers,
+            payload=payload_json,
+            provider_name="OpenRouter (pdfplumber)",
+            repair_schema=schema,
+            repair_model=OPENROUTER_MODEL,
+        )
+        if used_fallback and _needs_schema_repair(extracted_data, schema):
+            extracted_data = await _repair_json_to_schema(
+                endpoint=f"{OPENROUTER_BASE_URL.rstrip('/')}/chat/completions",
+                headers=headers,
+                model=OPENROUTER_MODEL,
+                schema=schema,
+                candidate=extracted_data,
+                provider_name="OpenRouter schema repair (pdfplumber)",
+            )
+        geometry_metadata = await to_thread.run_sync(
+            lambda: _apply_pdfplumber_bbox_copies(extracted_data, page_sizes)
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("OpenRouter structured extraction failed (pdfplumber)")
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                f"Structured extraction failed after pdfplumber: {exc}\n\n"
+                f"Extraction service traceback:\n{traceback.format_exc()}"
+            ),
+        ) from exc
+    finally:
+        _cleanup_downloaded_file(downloaded_file)
+        if pdfplumber_pdf_tmp is not None:
+            pdfplumber_pdf_tmp.cleanup()
+
+    elapsed = time.monotonic() - started_at
+    logger.info("pdfplumber full pipeline finished in %.2fs", elapsed)
+
+    return jsonable_encoder({
+        "analysis_id": payload.analysis_id,
+        "file_id": payload.file_id,
+        "file_type": payload.file_type,
+        "backend": "pdfplumber",
+        "model_parse": "pdfplumber",
+        "model_extract": OPENROUTER_MODEL,
+        "result": extracted_data,
+        "extraction": {"pages": [_build_result_page(extracted_data, raw_text=document_text)]},
+        "extraction_metadata": {
+            "docling_version": None,
+            "page_count": len(page_sizes),
+            "errors": [],
+            "provider": "pdfplumber+openrouter",
+            "provider_usage": provider_response.get("usage"),
+            "geometry": geometry_metadata,
+            "docx_conversion": None,
+        },
+    })
+
+
 async def _extract_via_docling_local(payload: ExtractionRequest) -> dict[str, Any]:
     _raise_docling_backend_unavailable("docling_local")
 
@@ -3490,8 +4571,47 @@ async def _extract_via_openrouter(payload: ExtractionRequest) -> dict[str, Any]:
             downloaded_file=downloaded_file,
         )
     )
+
+    # VLM-гибрид: для PDF на текстовом пути дополнительно прикладываем изображения
+    # страниц с таблицами, чтобы модель сверяла значения по картинке (устойчивее к
+    # сложным двухуровневым шапкам). При ошибке — молча остаёмся на тексте.
+    vision_pages_sent = 0
+    if (
+        VISION_TABLES_ENABLED
+        and use_text_path
+        and is_pdf
+        and not LLM_IS_YANDEX
+        and PYMUPDF_INSTALLED
+    ):
+        try:
+            image_parts = await to_thread.run_sync(
+                lambda: _render_table_pages_to_images(
+                    downloaded_file.local_path,
+                    dpi=VISION_DPI,
+                    max_pages=VISION_MAX_TABLE_PAGES,
+                )
+            )
+            if image_parts:
+                user_msg = messages[0]
+                text_content = user_msg["content"]
+                new_content: list[dict[str, Any]] = [
+                    {"type": "text", "text": (
+                        text_content
+                        + "\n\nНиже приложены изображения страниц документа с таблицами. "
+                        "Сверяй значения по картинке: ячейку бери на пересечении строки нужной "
+                        "модели и нужного столбца шапки."
+                    )},
+                ]
+                for part in image_parts:
+                    new_content.append({"type": part["type"], "image_url": part["image_url"]})
+                user_msg["content"] = new_content
+                vision_pages_sent = len(image_parts)
+                logger.info("vision-hybrid: attached %d table-page images", vision_pages_sent)
+        except Exception:  # noqa: BLE001
+            logger.exception("vision-hybrid failed; continuing with text-only path")
+
     payload_json: dict[str, Any] = {
-        "model": OPENROUTER_MODEL,
+        "model": VISION_MODEL if vision_pages_sent else OPENROUTER_MODEL,
         "messages": messages,
         "temperature": 0,
         "max_tokens": OPENROUTER_MAX_TOKENS,
@@ -3604,7 +4724,7 @@ async def _extract_via_openrouter(payload: ExtractionRequest) -> dict[str, Any]:
         "file_type": payload.file_type,
         "backend": "openrouter",
         "model_parse": OPENROUTER_MODEL,
-        "model_extract": OPENROUTER_MODEL,
+        "model_extract": VISION_MODEL if vision_pages_sent else OPENROUTER_MODEL,
         "result": extracted_data,
         "extraction": {"pages": [_build_result_page(extracted_data)]},
         "extraction_metadata": {
@@ -3614,6 +4734,11 @@ async def _extract_via_openrouter(payload: ExtractionRequest) -> dict[str, Any]:
             "provider": "openrouter",
             "provider_usage": provider_response.get("usage"),
             "geometry": geometry_metadata,
+            "vision_hybrid": {
+                "enabled": VISION_TABLES_ENABLED,
+                "pages_sent": vision_pages_sent,
+                "model": VISION_MODEL if vision_pages_sent else None,
+            },
             "docx_conversion": docx_conversion_metadata,
             "excel_conversion": excel_conversion_metadata,
             "pdf_conversion": pdf_conversion_metadata,
@@ -3937,4 +5062,8 @@ async def extract_document(payload: ExtractionRequest) -> dict:
         return await _extract_via_openrouter(payload)
     if backend == "llamaparse":
         return await _extract_via_llamaparse(payload)
+    if backend == "mineru":
+        return await _extract_via_mineru(payload)
+    if backend == "pdfplumber":
+        return await _extract_via_pdfplumber(payload)
     raise HTTPException(status_code=400, detail=f"Unsupported backend: {backend}")
