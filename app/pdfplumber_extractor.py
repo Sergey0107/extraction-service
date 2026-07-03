@@ -19,8 +19,20 @@ PyMuPDF. Конвертация не нужна: bbox можно передав�
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any, Optional
+
+# Те же ключевые слова, что использует openrouter-бэкенд (_RELEVANCE_KEYWORDS в
+# main.py) для отбора страниц с характеристиками в больших документах.
+_RELEVANCE_KEYWORDS = re.compile(
+    r"характерист|параметр|показател|спецификац|specification|parameter|"
+    r"техничес|nominal|dimension|габарит|размер|масс[аы]|вес\b|"
+    r"мощност|напор|подач[аи]|производител|давлен|температур|"
+    r"частот|оборот|диаметр|длин[аы]|ширин[аы]|высот[аы]|"
+    r"марк[аи]|модел[ьи]|тип\b|обозначен",
+    re.IGNORECASE,
+)
 
 
 @dataclass
@@ -184,6 +196,80 @@ def _group_words_into_lines(words: list[dict[str, Any]]) -> list[CellGeometry]:
             CellGeometry(text=text, bbox=(round(x0, 2), round(top, 2), round(x1, 2), round(bottom, 2)))
         )
     return lines_out
+
+
+def _page_text_for_relevance(page: PageGeometry) -> str:
+    """Весь текст страницы (ячейки таблиц + строки вне таблиц) — для проверки
+    ключевых слов при решении "оставить/выбросить" страницу."""
+    parts: list[str] = []
+    for table in page.tables:
+        for row in table:
+            for cell in row:
+                if cell is not None and cell.text:
+                    parts.append(cell.text)
+    for line in page.lines:
+        parts.append(line.text)
+    return " ".join(parts)
+
+
+def _page_payload_size(page: PageGeometry) -> int:
+    """Оценка РЕАЛЬНОГО объёма, который страница добавит в payload для LLM —
+    т.е. с учётом bbox-меток и служебных строк ('[bbox=[...]] "..."'), а не
+    только длины текста. bbox-метки добавляют существенный объём (координаты
+    + разметка на КАЖДУЮ ячейку/строку), поэтому чистая длина текста
+    недооценивает итоговый размер в разы — из-за этого при пороге,
+    рассчитанном по чистому тексту, реальный payload всё равно обрезался."""
+    text, _ = build_llm_payload([page], max_chars=10**9)
+    return len(text)
+
+
+def filter_relevant_pages(
+    pages: list[PageGeometry], max_chars: int = 150000
+) -> tuple[list[PageGeometry], bool]:
+    """Для больших документов (много страниц титульного/сервисного текста —
+    техника безопасности, гарантии, содержание) отбирает страницы, вероятно
+    содержащие характеристики, чтобы не обрезать payload посередине таблицы.
+
+    Правила (симметрично _filter_relevant_pages в main.py для openrouter):
+    всегда сохраняем первую и последнюю страницу; страницу с таблицей —
+    ВСЕГДА (там могут быть характеристики независимо от ключевых слов);
+    страницу с ключевыми словами характеристик — тоже; плюс СОСЕДЕЙ страниц
+    с таблицами (чтобы не оторвать шапку таблицы от строк на следующей
+    странице). max_chars сверяется с РЕАЛЬНЫМ размером payload (bbox-метки),
+    а не голым текстом — иначе порог оказывается заниженным и всё равно
+    обрезает документ посередине таблицы. Если после фильтрации остаётся
+    мало страниц или общий объём и так укладывается в лимит — возвращаем
+    все страницы без изменений."""
+    total_len = sum(_page_payload_size(p) for p in pages)
+    if total_len <= max_chars:
+        return pages, False
+
+    n = len(pages)
+    keep: set[int] = set()
+    for i, page in enumerate(pages):
+        text = _page_text_for_relevance(page)
+        if not text.strip():
+            continue
+        if i == 0 or i == n - 1:
+            keep.add(i)
+            continue
+        if page.tables or _RELEVANCE_KEYWORDS.search(text):
+            keep.add(i)
+
+    # Целостность таблиц: подтягиваем соседей страниц с таблицами.
+    for i, page in enumerate(pages):
+        if page.tables:
+            for j in (i - 1, i + 1):
+                if 0 <= j < n and _page_text_for_relevance(pages[j]).strip():
+                    keep.add(j)
+
+    if not keep:
+        return pages, False
+    if len(keep) < 3 and n > 5:
+        return pages, False
+
+    filtered = [pages[i] for i in sorted(keep)]
+    return filtered, True
 
 
 def build_llm_payload(pages: list[PageGeometry], max_chars: int = 60000) -> tuple[str, bool]:

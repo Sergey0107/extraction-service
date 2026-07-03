@@ -78,6 +78,7 @@ from app.mineru_client import MineruError, extract_tables_mineru
 from app.models import DownloadedFile, ExtractionRequest, PdfPageIndex, PdfWord
 from app.pdfplumber_extractor import build_llm_payload as build_pdfplumber_llm_payload
 from app.pdfplumber_extractor import extract_pdf_geometry
+from app.pdfplumber_extractor import filter_relevant_pages as filter_pdfplumber_pages
 from app.schema_utils import normalize_json_schema
 
 
@@ -4151,6 +4152,18 @@ async def _extract_via_mineru(payload: ExtractionRequest) -> dict[str, Any]:
     })
 
 
+# Большие технические паспорта/руководства (60-70+ страниц) почти целиком
+# релевантны по ключевым словам характеристик — фильтрация страниц не может
+# сильно сократить такой документ. Чтобы не терять модели/характеристики с
+# "хвоста" документа, лимит подобран так, чтобы вместить типичный крупный
+# паспорт целиком (наблюдался реальный payload ~254k символов на 67 страниц).
+PDFPLUMBER_MAX_PAYLOAD_CHARS = 400000
+# Completion-лимит для pdfplumber-бэкенда отдельный от общего OPENROUTER_MAX_TOKENS:
+# документ с большим payload обычно содержит МНОГО моделей/характеристик, ответ
+# JSON получается длиннее, чем у остальных бэкендов — иначе ответ обрывается
+# (finish_reason=length) и весь JSON становится невалидным.
+PDFPLUMBER_MAX_TOKENS = 32000
+
 PDFPLUMBER_BBOX_PROMPT_RULES = (
     "\n\nВАЖНО: ФОРМАТ ДОКУМЕНТА НИЖЕ — НЕ MARKDOWN. Если в инструкциях выше "
     "упоминались Markdown-таблицы со строками '|' и разделителем '| --- |' — "
@@ -4161,12 +4174,28 @@ PDFPLUMBER_BBOX_PROMPT_RULES = (
     'координатами в формате [bbox=[x0, top, x1, bottom]] "текст". Эти координаты '
     "извлечены программно из PDF (через pdfplumber) — они АБСОЛЮТНО ТОЧНЫЕ.\n"
     "• Внутри '-- Таблица K --' фрагменты идут по ЯЧЕЙКАМ строка за строкой — "
-    "каждая непустая ячейка таблицы (одна модель/типоразмер = одна строка) "
-    "выведена как отдельный [bbox=...] с текстом именно этой ячейки, а НЕ всей "
-    "строки и не всей таблицы. ТАБЛИЦА МОЖЕТ СОДЕРЖАТЬ МНОГО МОДЕЛЕЙ (много "
-    "строк) — извлекай характеристики КАЖДОЙ модели из таблицы, не только "
-    "первой попавшейся или той, что кажется 'главной'. Если пользователь явно "
-    "не указал конкретную модель — извлеки ВСЕ модели, представленные в таблице.\n"
+    "каждая непустая ячейка таблицы выведена как отдельный [bbox=...] с "
+    "текстом именно этой ячейки, а НЕ всей строки и не всей таблицы. "
+    "ТАБЛИЦА МОЖЕТ СОДЕРЖАТЬ МНОГО МОДЕЛЕЙ — извлекай характеристики КАЖДОЙ "
+    "модели, не только первой попавшейся или той, что кажется 'главной'. Если "
+    "пользователь явно не указал конкретную модель — извлеки ВСЕ модели.\n"
+    "• Таблица может быть организована ДВУМЯ способами — определи по первым "
+    "1-2 строкам:\n"
+    "  (а) ОБЫЧНАЯ: одна СТРОКА = одна модель (первый столбец — код модели, "
+    "остальные столбцы — характеристики с единицами в заголовке).\n"
+    "  (б) ТРАНСПОНИРОВАННАЯ: одна СТРОКА = одна характеристика (первый "
+    "столбец — название параметра типа 'Подача, м3/ч', 'Напор, м', "
+    "'Масса, кг'), а КОДЫ МОДЕЛЕЙ идут в шапке как отдельная строка-заголовок "
+    "('Типоразмер насоса', далее сама строка с кодами '20-50', '20-110', "
+    "'32-150', ...) — тогда каждый СТОЛБЕЦ (кроме первого) = одна модель, а "
+    "значение характеристики для этой модели — ячейка на пересечении СТРОКИ "
+    "параметра и СТОЛБЦА модели. В таком случае извлеки ВСЕ модели-столбцы "
+    "(их часто 5-10+ в одной таблице), а не 1-2 первых.\n"
+    "• Одна и та же таблица физически может продолжаться в нескольких "
+    "'-- Таблица K --' на СОСЕДНИХ страницах (одна широкая таблица с моделями "
+    "разбита pdfplumber на несколько блоков, т.к. не помещается на одной "
+    "странице) — тогда это ОДНА логическая таблица, объедини все её столбцы/"
+    "модели при извлечении.\n"
     "• Если под ячейкой таблицы дополнительно идут строки с пометкой "
     "'(строка внутри ячейки выше)' — это значит сама ячейка МНОГОСТРОЧНАЯ "
     "(содержит несколько характеристик, перечисленных через перенос строки, "
@@ -4333,11 +4362,23 @@ async def _extract_via_pdfplumber(payload: ExtractionRequest) -> dict[str, Any]:
             )
 
         pages = await to_thread.run_sync(lambda: extract_pdf_geometry(pdf_local_path))
-        document_text, truncated = build_pdfplumber_llm_payload(pages)
+        # page_sizes — из ВСЕХ страниц (нужны для валидации bbox независимо от
+        # того, какие страницы попали в payload после фильтрации ниже).
         page_sizes = {p.page_number: (p.width, p.height) for p in pages}
+        # Большие документы (много титульных/сервисных страниц — техника
+        # безопасности, гарантии, содержание) иначе обрезаются посередине
+        # таблицы характеристик из-за лимита max_chars. Отбираем страницы с
+        # таблицами/ключевыми словами (как делает openrouter-бэкенд), остальное
+        # не отправляем в LLM вообще — не в обрезке, а в целевом отборе.
+        relevant_pages, pages_filtered = await to_thread.run_sync(
+            lambda: filter_pdfplumber_pages(pages, max_chars=PDFPLUMBER_MAX_PAYLOAD_CHARS)
+        )
+        document_text, truncated = build_pdfplumber_llm_payload(
+            relevant_pages, max_chars=PDFPLUMBER_MAX_PAYLOAD_CHARS
+        )
         logger.info(
-            "pdfplumber geometry extracted: %d pages, payload_len=%d, truncated=%s",
-            len(pages), len(document_text), truncated,
+            "pdfplumber geometry extracted: %d/%d pages kept (filtered=%s), payload_len=%d, truncated=%s",
+            len(relevant_pages), len(pages), pages_filtered, len(document_text), truncated,
         )
     except HTTPException:
         _cleanup_downloaded_file(downloaded_file)
@@ -4366,7 +4407,7 @@ async def _extract_via_pdfplumber(payload: ExtractionRequest) -> dict[str, Any]:
         "model": OPENROUTER_MODEL,
         "messages": messages,
         "temperature": 0,
-        "max_tokens": OPENROUTER_MAX_TOKENS,
+        "max_tokens": PDFPLUMBER_MAX_TOKENS,
         "stream": False,
         "response_format": _json_schema_response_format("pdfplumber_extraction", schema),
     }
@@ -4431,6 +4472,9 @@ async def _extract_via_pdfplumber(payload: ExtractionRequest) -> dict[str, Any]:
         "extraction_metadata": {
             "docling_version": None,
             "page_count": len(page_sizes),
+            "pages_sent_to_llm": len(relevant_pages),
+            "pages_filtered": pages_filtered,
+            "payload_truncated": truncated,
             "errors": [],
             "provider": "pdfplumber+openrouter",
             "provider_usage": provider_response.get("usage"),
