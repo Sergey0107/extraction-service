@@ -4225,8 +4225,30 @@ PDFPLUMBER_BBOX_PROMPT_RULES = (
 )
 
 _PDFPLUMBER_BBOX_RE = re.compile(
-    r"^PDFPLUMBER_BBOX\|(\d+)\|(-?[\d.]+),(-?[\d.]+),(-?[\d.]+),(-?[\d.]+)\s*$"
+    r"PDFPLUMBER_BBOX\|(\d+)\|(-?[\d.]+),(-?[\d.]+),(-?[\d.]+),(-?[\d.]+)"
 )
+
+
+def _find_pdfplumber_bbox_marker(
+    reference: dict[str, Any]
+) -> "tuple[re.Match, str] | None":
+    """Ищет маркер координат PDFPLUMBER_BBOX|... среди ЛЮБОГО строкового
+    значения в reference — не в конкретном ожидаемом поле.
+
+    LLM непредсказуемо кладёт маркер в разные поля схемы в зависимости от
+    документа: наблюдалось в locator_text (как задумано), bbox (по смыслу
+    имени поля), locator_strategy (тоже по смыслу — 'как искать позицию').
+    Вместо того чтобы угадывать очередное поле, сканируем ВСЕ строковые
+    значения объекта — маркер достаточно специфичен (жёсткий префикс
+    'PDFPLUMBER_BBOX|'), чтобы не давать ложных срабатываний на обычном
+    тексте цитат. Возвращает (match, имя_поля) — имя поля нужно вызывающему,
+    чтобы очистить его от служебной строки в финальном ответе."""
+    for field_name, value in reference.items():
+        if isinstance(value, str) and "PDFPLUMBER_BBOX|" in value:
+            m = _PDFPLUMBER_BBOX_RE.search(value)
+            if m:
+                return m, field_name
+    return None
 
 
 def _apply_pdfplumber_bbox_copies(
@@ -4264,23 +4286,21 @@ def _apply_pdfplumber_bbox_copies(
             metadata["reference_count"] += 1
 
             # LLM должна класть маркер строго в locator_text, но на практике
-            # иногда кладёт его в bbox (поле называется 'bbox', и модель по
-            # смыслу имени решает, что координаты идут туда, несмотря на явную
-            # инструкцию) или другие текстовые поля. Ищем маркер по всем полям
-            # reference, где он мог оказаться, а не только в ожидаемом месте —
-            # иначе валидный dословно скопированный bbox отбрасывается.
-            match = None
-            for field in ("locator_text", "bbox", "quote_text", "anchor_text"):
-                raw = reference.get(field)
-                if raw is None:
-                    continue
-                m = _PDFPLUMBER_BBOX_RE.match(str(raw).strip())
-                if m:
-                    match = m
-                    break
-            if not match:
+            # непредсказуемо кладёт его в разные поля (bbox, locator_strategy
+            # и т.п. — по смыслу имени поля, несмотря на явную инструкцию).
+            # Сканируем ВСЕ строковые значения reference вместо угадывания
+            # конкретного поля (см. _find_pdfplumber_bbox_marker).
+            found = _find_pdfplumber_bbox_marker(reference)
+            if not found:
                 reference["position_unverified"] = True
                 continue
+            match, source_field = found
+            # bbox/locator_strategy перезаписываются ниже безусловно; если
+            # маркер оказался в другом поле (quote_text, anchor_text и т.п.),
+            # очищаем его — иначе служебная строка попадёт во фронт как якобы
+            # цитата/якорь.
+            if source_field not in ("bbox", "locator_strategy"):
+                reference[source_field] = None
 
             page_number = int(match.group(1))
             x0, top, x1, bottom = (float(match.group(i)) for i in range(2, 6))
