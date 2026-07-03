@@ -212,6 +212,14 @@ def _page_text_for_relevance(page: PageGeometry) -> str:
     return " ".join(parts)
 
 
+def plain_text_for_quality_check(pages: list[PageGeometry]) -> str:
+    """Чистый текст документа (без bbox-разметки) — для внешней проверки
+    качества текстового слоя (пуст/мусор из-за битой кодировки шрифта/скана).
+    Используется вызывающим кодом (main.py), чтобы решить, нужен ли fallback
+    на бэкенд с OCR."""
+    return " ".join(_page_text_for_relevance(p) for p in pages)
+
+
 def _page_payload_size(page: PageGeometry) -> int:
     """Оценка РЕАЛЬНОГО объёма, который страница добавит в payload для LLM —
     т.е. с учётом bbox-меток и служебных строк ('[bbox=[...]] "..."'), а не

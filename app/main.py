@@ -79,6 +79,7 @@ from app.models import DownloadedFile, ExtractionRequest, PdfPageIndex, PdfWord
 from app.pdfplumber_extractor import build_llm_payload as build_pdfplumber_llm_payload
 from app.pdfplumber_extractor import extract_pdf_geometry
 from app.pdfplumber_extractor import filter_relevant_pages as filter_pdfplumber_pages
+from app.pdfplumber_extractor import plain_text_for_quality_check
 from app.schema_utils import normalize_json_schema
 
 
@@ -4419,6 +4420,28 @@ async def _extract_via_pdfplumber(payload: ExtractionRequest) -> dict[str, Any]:
             "pdfplumber geometry extracted: %d/%d pages kept (filtered=%s), payload_len=%d, truncated=%s",
             len(relevant_pages), len(pages), pages_filtered, len(document_text), truncated,
         )
+
+        # pdfplumber не умеет OCR: на сканах (нет текстового слоя) и PDF с битой
+        # кодировкой шрифта (текст — мешанина символов вроде 'u E', '5 g FE')
+        # он либо не находит ничего, либо LLM получает нечитаемый мусор — итог
+        # в обоих случаях 0 характеристик. openrouter-бэкенд уже умеет
+        # детектировать оба случая и делать OCR-fallback, поэтому передаём
+        # документ туда вместо того, чтобы возвращать пустой результат.
+        plain_text = await to_thread.run_sync(lambda: plain_text_for_quality_check(pages))
+        if not _text_layer_is_usable(plain_text):
+            logger.info(
+                "pdfplumber: text layer unusable (scan or garbled font) — "
+                "falling back to openrouter backend (has OCR)"
+            )
+            _cleanup_downloaded_file(downloaded_file)
+            if pdfplumber_pdf_tmp is not None:
+                pdfplumber_pdf_tmp.cleanup()
+            fallback_result = await _extract_via_openrouter(payload)
+            fallback_result["backend"] = "pdfplumber"
+            extraction_metadata = fallback_result.get("extraction_metadata")
+            if isinstance(extraction_metadata, dict):
+                extraction_metadata["pdfplumber_fallback"] = "openrouter (unusable text layer)"
+            return fallback_result
     except HTTPException:
         _cleanup_downloaded_file(downloaded_file)
         if pdfplumber_pdf_tmp is not None:
