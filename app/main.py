@@ -2753,6 +2753,15 @@ async def _chat_completion_json(
     model_key = str(payload.get("model") or "")
     skip_strict = model_key and _strict_schema_supported.get(model_key) is False
 
+    # Некоторые провайдеры (замечено на AI Tunnel для claude-sonnet-5) сами
+    # включают extended thinking на своё усмотрение даже без явного запроса —
+    # это резко увеличивает время ответа на больших документах и может увести
+    # модель от точного соблюдения структуры/схемы. Извлечению reasoning не
+    # нужен, поэтому глушим его явно, если вызывающий код не задал иное.
+    if "reasoning" not in payload:
+        payload = dict(payload)
+        payload["reasoning"] = {"enabled": False}
+
     actual_payload = payload
     if skip_strict and "response_format" in payload:
         actual_payload = dict(payload)
@@ -2770,6 +2779,10 @@ async def _chat_completion_json(
         response = await client.post(endpoint, json=actual_payload, headers=headers)
 
         if response.status_code >= 400 and "response_format" in actual_payload:
+            logger.warning(
+                "%s first attempt HTTP %s (with response_format); body=%s",
+                provider_name, response.status_code, response.text[:1000],
+            )
             if model_key:
                 _strict_schema_supported[model_key] = False
             fallback_payload = dict(actual_payload)
@@ -2784,6 +2797,10 @@ async def _chat_completion_json(
             used_fallback = True
             retry_response = await client.post(endpoint, json=fallback_payload, headers=headers)
             if retry_response.status_code >= 400:
+                logger.warning(
+                    "%s retry attempt (no response_format) HTTP %s; body=%s",
+                    provider_name, retry_response.status_code, retry_response.text[:1000],
+                )
                 _raise_provider_http_error(retry_response, provider_name)
             data = retry_response.json()
         else:
@@ -2834,7 +2851,43 @@ async def _chat_completion_json(
             )
             return {"products": parsed}, data, used_fallback
         raise RuntimeError(f"{provider_name} returned non-object JSON")
+    parsed = _normalize_flat_characteristics_payload(parsed, provider_name=provider_name)
     return parsed, data, used_fallback
+
+
+def _looks_like_characteristic_entry(value: Any) -> bool:
+    return (
+        isinstance(value, dict)
+        and "name" in value
+        and "value" in value
+        and isinstance(value.get("name"), str)
+    )
+
+
+def _normalize_flat_characteristics_payload(
+    parsed: dict[str, Any], *, provider_name: str
+) -> dict[str, Any]:
+    """Некоторые модели (например Qwen3.7-Max) иногда возвращают характеристики
+    как плоский словарь {имя: {name, value, references}} на верхнем уровне
+    вместо ожидаемого {"products": [{"characteristics": [...]}]}. Срабатывает
+    только когда products действительно отсутствует/некорректен — в остальных
+    случаях payload не трогается."""
+    products = parsed.get("products")
+    if isinstance(products, list):
+        return parsed
+
+    candidate_entries = [
+        value for value in parsed.values() if _looks_like_characteristic_entry(value)
+    ]
+    if not candidate_entries or len(candidate_entries) != len(parsed):
+        return parsed
+
+    logger.info(
+        "%s returned a flat characteristics dict at top level — wrapping into "
+        "{products: [{characteristics: [...]}]}",
+        provider_name,
+    )
+    return {"products": [{"product_name": None, "characteristics": candidate_entries}]}
 
 
 def _schema_required_keys(schema: dict[str, Any]) -> set[str]:
