@@ -5217,6 +5217,100 @@ async def render_pdf(url: str) -> Response:
     return _render_response(pdf_bytes)
 
 
+OCR_INDEX_CACHE_DIR = Path(tempfile.gettempdir()) / "ocr_index_cache"
+_ocr_index_locks: dict[str, asyncio.Lock] = {}
+_ocr_index_locks_guard = asyncio.Lock()
+
+
+async def _get_ocr_index_lock(key: str) -> asyncio.Lock:
+    async with _ocr_index_locks_guard:
+        lock = _ocr_index_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            _ocr_index_locks[key] = lock
+        return lock
+
+
+def _build_ocr_index_payload(local_path: str) -> dict:
+    document, pages = _build_pdf_page_index_ocr(local_path)
+    try:
+        pages_payload = []
+        for page_index in pages:
+            page_rect = page_index.page_rect or page_index.page.rect
+            words_payload = [
+                {
+                    "text": word.text,
+                    "bbox": _rect_to_bbox(word.rect, page_rect),
+                }
+                for word in page_index.words
+            ]
+            pages_payload.append(
+                {
+                    "page_number": page_index.page_number,
+                    "words": words_payload,
+                }
+            )
+    finally:
+        document.close()
+    return {"page_count": len(pages_payload), "pages": pages_payload}
+
+
+@app.get("/ocr-index")
+async def ocr_index(url: str) -> dict:
+    """Отдельный от основного /extract endpoint: строит постраничный OCR
+    word-индекс (текст + нормализованные координаты каждого слова) для
+    сканированного PDF по URL. Используется фронтендом лениво — только когда
+    пользователь открывает поиск/выделение на документе без текстового слоя.
+    Результат кэшируется на диске по стабильной части URL (как /render-pdf).
+
+    Намеренно не переиспользует и не меняет _enrich_references_with_pdf_geometry
+    и основной пайплайн /extract — это независимый read-only помощник."""
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"}:
+        raise HTTPException(status_code=400, detail="url must be http or https")
+    if not PYMUPDF_INSTALLED:
+        raise HTTPException(status_code=501, detail="PyMuPDF not available")
+
+    try:
+        import pytesseract
+
+        await to_thread.run_sync(pytesseract.get_tesseract_version)
+    except Exception as exc:
+        raise HTTPException(status_code=501, detail=f"OCR is not available: {exc}") from exc
+
+    cache_key = _render_cache_key(url)
+    cache_path = OCR_INDEX_CACHE_DIR / f"{cache_key}.json"
+    if cache_path.exists():
+        return json.loads(cache_path.read_text(encoding="utf-8"))
+
+    lock = await _get_ocr_index_lock(cache_key)
+    async with lock:
+        if cache_path.exists():
+            return json.loads(cache_path.read_text(encoding="utf-8"))
+
+        try:
+            downloaded = await _download_file(url)
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"Failed to download file: {exc}") from exc
+
+        try:
+            payload = await to_thread.run_sync(_build_ocr_index_payload, downloaded.local_path)
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"OCR failed: {exc}") from exc
+        finally:
+            _cleanup_downloaded_file(downloaded)
+
+        try:
+            OCR_INDEX_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            tmp_path = cache_path.with_suffix(".json.tmp")
+            tmp_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+            tmp_path.replace(cache_path)
+        except Exception as exc:
+            logger.warning("Failed to cache OCR index: %s", exc)
+
+    return payload
+
+
 @app.post("/extract")
 async def extract_document(payload: ExtractionRequest) -> dict:
     if not payload.schema_payload and not payload.prompt:
