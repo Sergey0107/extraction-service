@@ -53,7 +53,6 @@ except ImportError:
     DOCLING_INSTALLED = False
 
 logger = logging.getLogger("extraction_service")
-logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 
 
 def get_env(name: str, default: Optional[str] = None) -> Optional[str]:
@@ -152,6 +151,19 @@ MINERU_POLL_TIMEOUT = get_int_env("MINERU_POLL_TIMEOUT", 300)
 MINERU_POLL_INTERVAL = get_int_env("MINERU_POLL_INTERVAL", 5)
 MINERU_PAGE_RANGES = get_env("MINERU_PAGE_RANGES")  # напр. "5,7,14" — может игнорироваться API
 
+# --- paddleocr-vl-service (внешний сервис, вне этого репозитория) ---------
+# Отдельный микросервис: PaddleOCR-VL на GPU либо Yandex Cloud Vision OCR,
+# точная geometry уже готова (precise_bbox на уровне ячейки) — этот бэкенд НЕ
+# использует _enrich_references_with_pdf_geometry, в отличие от остальных.
+# Два backend-имени (paddleocr_vl / yandex_vision_ocr) для одного и того же
+# сервиса — разные OCR_PROVIDER внутри paddleocr-vl-service, независимое
+# включение/выключение (напр. yandex_vision_ocr пока недоступен из-за
+# биллинга на стороне Yandex Cloud, а paddleocr_vl требует GPU).
+PADDLEOCR_VL_ENABLED = get_env("PADDLEOCR_VL_ENABLED", "0") == "1"
+PADDLEOCR_VL_SERVICE_URL = get_env("PADDLEOCR_VL_SERVICE_URL", "http://paddleocr-vl-service:8000")
+PADDLEOCR_VL_REQUEST_TIMEOUT_SECONDS = get_int_env("PADDLEOCR_VL_REQUEST_TIMEOUT_SECONDS", 1800)
+YANDEX_VISION_OCR_ENABLED = get_env("YANDEX_VISION_OCR_ENABLED", "0") == "1"
+
 # --- VLM-гибрид для openrouter-бэкенда -------------------------------------
 # Страницы с таблицами дополнительно отдаются в gpt-4.1 как изображение (vision),
 # чтобы модель читала значения по картинке (устойчивее к сложным шапкам таблиц).
@@ -162,6 +174,7 @@ VISION_MAX_TABLE_PAGES = get_int_env("VISION_MAX_TABLE_PAGES", 8)
 
 SUPPORTED_BACKENDS = {
     "docling_local", "docling_remote", "openrouter", "llamaparse", "mineru", "pdfplumber",
+    "paddleocr_vl", "yandex_vision_ocr",
 }
 ACTIVE_BACKENDS = {"openrouter", "llamaparse"}
 # mineru активен только при наличии токена и явном включении.
@@ -170,6 +183,12 @@ if MINERU_ENABLED and MINERU_TOKEN:
 # pdfplumber не требует внешних сервисов/токенов — активен, если пакет установлен.
 if PDFPLUMBER_INSTALLED:
     ACTIVE_BACKENDS = ACTIVE_BACKENDS | {"pdfplumber"}
+# paddleocr_vl/yandex_vision_ocr — внешний сервис, активны только при явном
+# включении флагом (см. секцию "paddleocr-vl-service" выше).
+if PADDLEOCR_VL_ENABLED:
+    ACTIVE_BACKENDS = ACTIVE_BACKENDS | {"paddleocr_vl"}
+if YANDEX_VISION_OCR_ENABLED:
+    ACTIVE_BACKENDS = ACTIVE_BACKENDS | {"yandex_vision_ocr"}
 STUBBED_BACKENDS = SUPPORTED_BACKENDS - ACTIVE_BACKENDS
 if EXTRACTION_BACKEND not in ACTIVE_BACKENDS:
     logger.warning(

@@ -15,6 +15,10 @@ from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import unquote, urlparse
 
+from app.logging_setup import configure_logging
+
+configure_logging("extraction-service")
+
 import httpx
 from anyio import to_thread
 from docx import Document as WordDocument
@@ -62,6 +66,9 @@ from app.config import (
     OPENROUTER_PROVIDER_IGNORE,
     OPENROUTER_PROVIDER_ORDER,
     OPENROUTER_SITE_URL,
+    PADDLEOCR_VL_ENABLED,
+    PADDLEOCR_VL_REQUEST_TIMEOUT_SECONDS,
+    PADDLEOCR_VL_SERVICE_URL,
     PDFPLUMBER_INSTALLED,
     PYMUPDF_INSTALLED,
     REMOTE_API_TIMEOUT_SECONDS,
@@ -71,6 +78,7 @@ from app.config import (
     VISION_MAX_TABLE_PAGES,
     VISION_MODEL,
     VISION_TABLES_ENABLED,
+    YANDEX_VISION_OCR_ENABLED,
     fitz,
     logger,
 )
@@ -134,6 +142,11 @@ def _get_docling_version() -> Optional[str]:
         return version("docling")
     except PackageNotFoundError:
         return None
+
+
+def _redact_url(url: str) -> str:
+    """Drop query string (presigned S3 signatures) before logging a URL."""
+    return url.split("?", 1)[0] if url else url
 
 
 def _select_backend(requested_backend: Optional[str]) -> str:
@@ -971,6 +984,8 @@ def _build_openrouter_provider_preferences(*, require_parameters: bool) -> dict[
 
 async def _download_file(file_url: str) -> DownloadedFile:
     temp_path = ""
+    started_at = time.monotonic()
+    redacted_url = _redact_url(file_url)
     try:
         async with httpx.AsyncClient(
             timeout=FILE_DOWNLOAD_TIMEOUT_SECONDS,
@@ -985,13 +1000,28 @@ async def _download_file(file_url: str) -> DownloadedFile:
                     mimetypes.guess_extension((content_type or "").split(";", 1)[0].strip())
                     or ".pdf"
                 )
+                size_bytes = 0
                 with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as handle:
                     temp_path = handle.name
                     async for chunk in response.aiter_bytes():
                         handle.write(chunk)
+                        size_bytes += len(chunk)
     except httpx.HTTPError as exc:
+        status_code = getattr(getattr(exc, "response", None), "status_code", None)
+        logger.error(
+            "File download failed url=%s status=%s elapsed=%.2fs error=%s",
+            redacted_url, status_code, time.monotonic() - started_at, exc,
+        )
+        if temp_path:
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
         raise RuntimeError(f"Failed to download file: {exc}") from exc
     except Exception:
+        logger.exception(
+            "File download crashed url=%s elapsed=%.2fs", redacted_url, time.monotonic() - started_at,
+        )
         if temp_path:
             try:
                 os.remove(temp_path)
@@ -999,6 +1029,10 @@ async def _download_file(file_url: str) -> DownloadedFile:
                 logger.warning("Failed to remove temp file %s", temp_path)
         raise
 
+    logger.info(
+        "File downloaded url=%s filename=%s size_bytes=%d elapsed=%.2fs",
+        redacted_url, filename, size_bytes, time.monotonic() - started_at,
+    )
     return DownloadedFile(
         filename=filename,
         content_type=_normalized_content_type(filename, content_type),
@@ -2268,9 +2302,17 @@ def _find_reference_location(
     pages: list[PdfPageIndex],
     candidates: list[dict[str, Any]],
     context_terms: list[str] | None = None,
+    *,
+    label: str = "",
 ) -> dict[str, Any] | None:
     best_match: dict[str, Any] | None = None
     context_terms = context_terms or []
+    logger.debug(
+        "geometry: searching reference label=%r candidates=%s context_terms=%s",
+        label,
+        [(c.get("kind"), (c.get("text") or "")[:60]) for c in candidates],
+        context_terms,
+    )
     has_specific_candidate = any(
         candidate.get("kind") in {"quote_text", "value", "label_plus_value", "raw_reference"}
         for candidate in candidates
@@ -2354,6 +2396,11 @@ def _find_reference_location(
                         "matched_text": value_cand["text"],
                     }
                     break
+    logger.debug(
+        "geometry: pass0 (model table cell) label=%r result=%s",
+        label,
+        best_match["locator_strategy"] if best_match else None,
+    )
 
     def _do_exact_pass(page_list_fn):
         nonlocal best_match
@@ -2426,6 +2473,14 @@ def _find_reference_location(
         _do_exact_pass(lambda hint: _sorted_pages(hint))
         _do_token_pass(lambda hint: _sorted_pages(hint))
 
+    logger.debug(
+        "geometry: pass1+2 (exact+token) label=%r result=%s page=%s score=%s",
+        label,
+        best_match["locator_strategy"] if best_match else None,
+        best_match["page"] if best_match else None,
+        round(best_match["score"], 1) if best_match else None,
+    )
+
     # --- Pass 3: table row / free-text line search ---
     # find_tables() is expensive on large PDFs — skip if passes 1-2 found a confident match
     if not best_match or best_match["score"] <= 500:
@@ -2470,6 +2525,14 @@ def _find_reference_location(
                         "matched_text": candidate_text,
                     }
 
+    logger.debug(
+        "geometry: pass3 (table row) label=%r result=%s page=%s score=%s",
+        label,
+        best_match["locator_strategy"] if best_match else None,
+        best_match["page"] if best_match else None,
+        round(best_match["score"], 1) if best_match else None,
+    )
+
     # --- Pass 4: OCR-robust fuzzy search ---
     if best_match is None:
         fuzzy_candidates = [
@@ -2502,6 +2565,18 @@ def _find_reference_location(
                     "locator_strategy": "pymupdf_fuzzy",
                     "matched_text": candidate_text,
                 }
+
+    if best_match:
+        logger.debug(
+            "geometry: reference resolved label=%r strategy=%s page=%s score=%s matched_text=%r",
+            label, best_match["locator_strategy"], best_match["page"],
+            round(best_match["score"], 1), (best_match.get("matched_text") or "")[:80],
+        )
+    else:
+        logger.info(
+            "geometry: reference NOT found label=%r candidates=%d pages_searched=%d context_terms=%s",
+            label, len(candidates), len(pages), context_terms,
+        )
 
     return best_match
 
@@ -2543,7 +2618,10 @@ def _enrich_references_with_pdf_geometry(
     *,
     local_path: str,
     content_type: str | None,
+    log_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    log_extra = {**(log_context or {}), "step": "geometry_enrichment"}
+    unmatched_labels: list[str] = []
     metadata = {
         "enabled": GEOMETRY_ENRICHMENT_ENABLED,
         "provider": "pymupdf" if PYMUPDF_INSTALLED else None,
@@ -2645,11 +2723,27 @@ def _enrich_references_with_pdf_geometry(
                     value_context=value_context,
                     generic_anchors=generic_anchors,
                 )
+                reference_label = (
+                    holder.get("name") if isinstance(holder, dict) else None
+                ) or (label_context[0] if label_context else "") or "?"
                 if not candidates:
+                    logger.info(
+                        "geometry: reference skipped (no candidates) label=%r",
+                        reference_label,
+                        extra=log_extra,
+                    )
                     continue
 
-                match = _find_reference_location(pages, candidates, ancestor_context + label_context)
+                match = _find_reference_location(
+                    pages, candidates, ancestor_context + label_context, label=reference_label,
+                )
                 if not match:
+                    unmatched_labels.append(reference_label)
+                    logger.info(
+                        "geometry: reference NOT matched label=%r candidates=%d",
+                        reference_label, len(candidates),
+                        extra=log_extra,
+                    )
                     # Геометрия не смогла привязать цитату к месту в PDF.
                     # Для сканов (OCR) номер страницы от LLM — это догадка
                     # (обычно дефолтная "1"), показывать её как точную позицию нельзя:
@@ -2686,14 +2780,27 @@ def _enrich_references_with_pdf_geometry(
                     reference.pop("matched_text", None)
                 reference["match_score"] = round(float(match.get("score", 0.0)), 3)
                 metadata["matched_reference_count"] += 1
+                logger.info(
+                    "geometry: reference matched label=%r page=%s strategy=%s score=%.1f",
+                    reference_label, match["page"], match["locator_strategy"],
+                    reference["match_score"],
+                    extra=log_extra,
+                )
 
                 if isinstance(original_reference, dict):
                     original_reference.update(reference)
 
         metadata["applied"] = metadata["matched_reference_count"] > 0
+        metadata["unmatched_labels"] = unmatched_labels
+        logger.info(
+            "geometry enrichment summary: references=%d matched=%d unmatched=%s",
+            metadata["reference_count"], metadata["matched_reference_count"],
+            unmatched_labels,
+            extra=log_extra,
+        )
         return metadata
     except Exception as exc:
-        logger.exception("PyMuPDF geometry enrichment failed")
+        logger.exception("PyMuPDF geometry enrichment failed", extra=log_extra)
         metadata["errors"].append(str(exc))
         return metadata
     finally:
@@ -2913,6 +3020,11 @@ async def _repair_json_to_schema(
     candidate: dict[str, Any],
     provider_name: str,
 ) -> dict[str, Any]:
+    missing_keys = _schema_required_keys(schema) - candidate.keys()
+    started_at = time.monotonic()
+    logger.info(
+        "%s: repairing JSON, missing required keys=%s", provider_name, sorted(missing_keys),
+    )
     repair_prompt = (
         "Преобразуй исходный JSON к целевой схеме. "
         "Сохрани все фактические значения. Не придумывай данные. "
@@ -2929,11 +3041,22 @@ async def _repair_json_to_schema(
         "stream": False,
         "response_format": _json_schema_response_format("json_schema_repair", schema),
     }
-    repaired, _, _ = await _chat_completion_json(
-        endpoint=endpoint,
-        headers=headers,
-        payload=repair_payload,
-        provider_name=provider_name,
+    try:
+        repaired, _, _ = await _chat_completion_json(
+            endpoint=endpoint,
+            headers=headers,
+            payload=repair_payload,
+            provider_name=provider_name,
+        )
+    except Exception:
+        logger.exception(
+            "%s: repair failed after %.2fs", provider_name, time.monotonic() - started_at,
+        )
+        raise
+    still_missing = _schema_required_keys(schema) - repaired.keys()
+    logger.info(
+        "%s: repair finished in %.2fs, still_missing_keys=%s",
+        provider_name, time.monotonic() - started_at, sorted(still_missing),
     )
     return repaired
 
@@ -4206,6 +4329,184 @@ async def _extract_via_mineru(payload: ExtractionRequest) -> dict[str, Any]:
     })
 
 
+def _paddle_bbox_to_reference_bbox(
+    bbox_px: list[float], page_width: float, page_height: float
+) -> dict[str, float]:
+    """Конвертирует [x0,y0,x1,y1] в пикселях Paddle-рендера страницы в формат
+    bbox, ожидаемый фронтендом ivolga (см. _rect_to_bbox выше в этом файле —
+    та функция работает с fitz.Rect, эта — с плоским списком пикселей).
+    Нормализованные norm_x0..norm_y1 (0..1) имеют наивысший приоритет в
+    pdf-analyzer/src/services/mappers/bbox.ts::bboxWithUnits(), поэтому
+    именно они, а не абсолютные пиксели/points, гарантируют корректную
+    подсветку независимо от DPI рендера на стороне paddleocr-vl-service."""
+    x0, y0, x1, y1 = bbox_px
+    return {
+        "x0": x0, "y0": y0, "x1": x1, "y1": y1,
+        "left": x0, "top": y0, "right": x1, "bottom": y1,
+        "x": x0, "y": y0, "width": x1 - x0, "height": y1 - y0,
+        "norm_x0": x0 / page_width, "norm_y0": y0 / page_height,
+        "norm_x1": x1 / page_width, "norm_y1": y1 / page_height,
+    }
+
+
+def _paddleocr_vl_specs_to_products(
+    specifications: list[dict[str, Any]], paddle_pages: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Конвертирует yandex.specifications[] (формат paddleocr-vl-service) в
+    result.products[].characteristics[] (формат ivolga), группируя по
+    variant — один product на уникальный variant, характеристики без variant
+    попадают в отдельный product "Общее"."""
+    page_dims: dict[int, tuple[float, float]] = {}
+    for idx, page in enumerate(paddle_pages):
+        pruned = (page or {}).get("prunedResult") or {}
+        width, height = pruned.get("width"), pruned.get("height")
+        if width and height:
+            page_dims[idx] = (float(width), float(height))
+
+    products_by_variant: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+
+    for spec in specifications:
+        variant = spec.get("variant") or "Общее"
+        if variant not in products_by_variant:
+            products_by_variant[variant] = {"product_name": variant, "characteristics": []}
+            order.append(variant)
+
+        value = spec.get("value") or ""
+        unit = spec.get("unit")
+        value_text = f"{value} {unit}".strip() if unit else value
+
+        source = spec.get("source") or {}
+        page_index = source.get("page_index")
+        blocks = source.get("blocks") or []
+
+        references: list[dict[str, Any]] = []
+        for block in blocks:
+            block_bbox = block.get("precise_bbox") or block.get("block_bbox")
+            if block_bbox is None or page_index is None:
+                continue
+            dims = page_dims.get(page_index)
+            reference: dict[str, Any] = {
+                # +1: paddleocr-vl-service использует 0-based page_index,
+                # ivolga (references[].page) ожидает 1-based (см. Этап 0
+                # аудита — _reference_to_span в api-gateway игнорирует page,
+                # если он не положительный int).
+                "page": page_index + 1,
+                "page_number": page_index + 1,
+                "quote_text": value,
+                "anchor_text": spec.get("name"),
+                "matched_text": value,
+                "locator_strategy": "bbox",
+                "geometry_source": "paddleocr_vl",
+                "position_unverified": False,
+            }
+            if dims is not None:
+                reference["bbox"] = _paddle_bbox_to_reference_bbox(block_bbox, *dims)
+            references.append(reference)
+
+        products_by_variant[variant]["characteristics"].append(
+            {
+                "name": spec.get("name"),
+                "value": value_text,
+                "references": references,
+            }
+        )
+
+    return [products_by_variant[v] for v in order]
+
+
+async def _extract_via_paddleocr_vl(payload: ExtractionRequest) -> dict[str, Any]:
+    """Извлечение через внешний микросервис paddleocr-vl-service (PaddleOCR-VL
+    на GPU, либо Yandex Cloud Vision OCR — выбор зависит от того, какое из
+    двух backend-имён запрошено: "paddleocr_vl" или "yandex_vision_ocr").
+
+    В отличие от openrouter/mineru, geometry здесь НЕ требует
+    _enrich_references_with_pdf_geometry — paddleocr-vl-service уже отдаёт
+    точный bbox каждого значения (precise_locator на его стороне), поэтому
+    эта функция ограничивается конвертацией формата ответа. Файл НЕ
+    скачивается на этой стороне (в отличие от _extract_via_mineru) —
+    paddleocr-vl-service сам скачивает по payload.file_url через свой
+    /extract-specs-by-url эндпоинт.
+    """
+    backend = (payload.backend or "").strip().lower()
+    if backend == "yandex_vision_ocr":
+        if not YANDEX_VISION_OCR_ENABLED:
+            raise HTTPException(
+                status_code=501,
+                detail="Backend 'yandex_vision_ocr' is disabled: set YANDEX_VISION_OCR_ENABLED=1.",
+            )
+        ocr_provider = "yandex_vision"
+    else:
+        if not PADDLEOCR_VL_ENABLED:
+            raise HTTPException(
+                status_code=501,
+                detail="Backend 'paddleocr_vl' is disabled: set PADDLEOCR_VL_ENABLED=1.",
+            )
+        ocr_provider = "paddle"
+
+    filename = _guess_filename_from_url(payload.file_url, None)
+    started_at = time.monotonic()
+
+    try:
+        async with httpx.AsyncClient(timeout=PADDLEOCR_VL_REQUEST_TIMEOUT_SECONDS) as client:
+            response = await client.post(
+                f"{PADDLEOCR_VL_SERVICE_URL.rstrip('/')}/extract-specs-by-url",
+                json={"file_url": payload.file_url, "filename": filename, "ocr_provider": ocr_provider},
+            )
+            response.raise_for_status()
+            data = response.json()
+    except httpx.HTTPStatusError as exc:
+        logger.exception("paddleocr-vl-service returned an error")
+        raise HTTPException(
+            status_code=502,
+            detail=f"paddleocr-vl-service failed: {exc.response.status_code} {exc.response.text[:500]}",
+        ) from exc
+    except httpx.RequestError as exc:
+        logger.exception("Failed to reach paddleocr-vl-service")
+        raise HTTPException(status_code=502, detail=f"Failed to reach paddleocr-vl-service: {exc!r}") from exc
+
+    paddle_pages = (data.get("paddle") or {}).get("pages") or []
+    yandex_result = data.get("yandex") or {}
+    specifications = yandex_result.get("specifications") or []
+
+    products = _paddleocr_vl_specs_to_products(specifications, paddle_pages)
+    elapsed = time.monotonic() - started_at
+    logger.info(
+        "paddleocr_vl extraction finished in %.2fs, %d specifications -> %d products",
+        elapsed, len(specifications), len(products),
+    )
+
+    return jsonable_encoder({
+        "analysis_id": payload.analysis_id,
+        "file_id": payload.file_id,
+        "file_type": payload.file_type,
+        "backend": backend or "paddleocr_vl",
+        "model_parse": ocr_provider,
+        "model_extract": "yandex-deepseek-v4-flash",
+        "result": {"products": products},
+        "extraction": {"pages": [_build_result_page({"products": products})]},
+        "extraction_metadata": {
+            "docling_version": None,
+            "page_count": len(paddle_pages),
+            "errors": [],
+            "provider": f"paddleocr-vl-service/{ocr_provider}",
+            "provider_usage": None,
+            "geometry": {
+                "enabled": True,
+                "provider": "paddleocr_vl_precise_locator",
+                "applied": True,
+                "page_count": len(paddle_pages),
+            },
+            "ocr_provider": ocr_provider,
+            "pages_processed": yandex_result.get("pages_processed"),
+            "pages_failed": yandex_result.get("pages_failed"),
+            "has_text_layer": yandex_result.get("has_text_layer"),
+            "ocr_fallback_used": yandex_result.get("ocr_fallback_used"),
+            "docx_conversion": None,
+        },
+    })
+
+
 # Большие технические паспорта/руководства (60-70+ страниц) почти целиком
 # релевантны по ключевым словам характеристик — фильтрация страниц не может
 # сильно сократить такой документ. Чтобы не терять модели/характеристики с
@@ -4622,6 +4923,13 @@ async def _extract_via_docling_remote(payload: ExtractionRequest) -> dict[str, A
 
 
 async def _extract_via_openrouter(payload: ExtractionRequest) -> dict[str, Any]:
+    log_extra = {
+        "analysis_id": payload.analysis_id,
+        "file_id": payload.file_id,
+        "file_type": payload.file_type,
+    }
+    stage_timings: dict[str, float] = {}
+
     if not payload.prompt and not payload.schema_payload:
         raise HTTPException(status_code=400, detail="schema or prompt is required")
     if not OPENROUTER_API_KEY:
@@ -4635,26 +4943,35 @@ async def _extract_via_openrouter(payload: ExtractionRequest) -> dict[str, Any]:
         "Не добавляй markdown, пояснения или кодовые блоки."
     )
 
+    download_started_at = time.monotonic()
     downloaded_file = await _download_file(payload.file_url)
+    stage_timings["download"] = time.monotonic() - download_started_at
     is_docx = _looks_like_docx(downloaded_file.filename, downloaded_file.content_type)
     is_excel = _looks_like_excel(downloaded_file.filename, downloaded_file.content_type)
     is_pdf = _looks_like_pdf(downloaded_file.filename, downloaded_file.content_type)
     logger.info(
-        "File detected: filename=%r content_type=%r is_docx=%s is_excel=%s is_pdf=%s",
+        "File detected: filename=%r content_type=%r is_docx=%s is_excel=%s is_pdf=%s downloaded_in=%.2fs",
         downloaded_file.filename, downloaded_file.content_type, is_docx, is_excel, is_pdf,
+        stage_timings["download"],
+        extra={**log_extra, "step": "download"},
     )
     docx_conversion_metadata: dict[str, Any] | None = None
     excel_conversion_metadata: dict[str, Any] | None = None
     pdf_conversion_metadata: dict[str, Any] | None = None
     docx_pdf_temp_dir: tempfile.TemporaryDirectory | None = None
 
+    text_conversion_started_at = time.monotonic()
     if is_docx:
         try:
             docx_conversion_metadata = await to_thread.run_sync(
                 lambda: _convert_docx_to_structured_text(downloaded_file.local_path)
             )
         except Exception as exc:
-            logger.exception("DOCX conversion failed")
+            logger.exception(
+                "DOCX conversion failed after %.2fs",
+                time.monotonic() - text_conversion_started_at,
+                extra={**log_extra, "step": "docx_conversion"},
+            )
             raise HTTPException(
                 status_code=502,
                 detail=(
@@ -4668,7 +4985,11 @@ async def _extract_via_openrouter(payload: ExtractionRequest) -> dict[str, Any]:
                 lambda: _convert_xlsx_to_structured_text(downloaded_file.local_path)
             )
         except Exception as exc:
-            logger.exception("Excel conversion failed")
+            logger.exception(
+                "Excel conversion failed after %.2fs",
+                time.monotonic() - text_conversion_started_at,
+                extra={**log_extra, "step": "excel_conversion"},
+            )
             raise HTTPException(
                 status_code=502,
                 detail=(
@@ -4689,13 +5010,22 @@ async def _extract_via_openrouter(payload: ExtractionRequest) -> dict[str, Any]:
                 )
             )
             logger.info(
-                "PDF text extraction: ocr_applied=%s text_len=%d",
+                "PDF text extraction: ocr_applied=%s text_len=%d page_count=%s elapsed=%.2fs",
                 pdf_conversion_metadata.get("ocr_applied"),
                 len(pdf_conversion_metadata.get("text") or ""),
+                pdf_conversion_metadata.get("page_count"),
+                time.monotonic() - text_conversion_started_at,
+                extra={**log_extra, "step": "pdf_text_extraction"},
             )
         except Exception as exc:
-            logger.warning("PDF text extraction failed, falling back to file-parser: %s", exc)
+            logger.warning(
+                "PDF text extraction failed after %.2fs, falling back to file-parser: %s",
+                time.monotonic() - text_conversion_started_at, exc,
+                exc_info=True,
+                extra={**log_extra, "step": "pdf_text_extraction"},
+            )
             pdf_conversion_metadata = None
+    stage_timings["text_conversion"] = time.monotonic() - text_conversion_started_at
 
     # Определяем текст документа для text-пути
     use_text_path = False
@@ -4730,7 +5060,11 @@ async def _extract_via_openrouter(payload: ExtractionRequest) -> dict[str, Any]:
             detail="Yandex AI: image extraction is not supported (no vision API).",
         )
 
-    logger.info("Extraction path: use_text_path=%s document_text_len=%d", use_text_path, len(document_text))
+    logger.info(
+        "Extraction path: use_text_path=%s document_text_len=%d",
+        use_text_path, len(document_text),
+        extra={**log_extra, "step": "path_selection"},
+    )
 
     messages = (
         _build_openrouter_messages_from_text(
@@ -4824,6 +5158,7 @@ async def _extract_via_openrouter(payload: ExtractionRequest) -> dict[str, Any]:
     geometry_local_path = downloaded_file.local_path
     geometry_content_type = downloaded_file.content_type
     try:
+        llm_started_at = time.monotonic()
         extracted_data, provider_response, used_fallback = await _chat_completion_json(
             endpoint=f"{OPENROUTER_BASE_URL.rstrip('/')}/chat/completions",
             headers=headers,
@@ -4832,7 +5167,18 @@ async def _extract_via_openrouter(payload: ExtractionRequest) -> dict[str, Any]:
             repair_schema=schema,
             repair_model=OPENROUTER_MODEL,
         )
+        stage_timings["llm_call"] = time.monotonic() - llm_started_at
+        logger.info(
+            "OpenRouter chat completion done in %.2fs used_fallback=%s usage=%s",
+            stage_timings["llm_call"], used_fallback, provider_response.get("usage"),
+            extra={**log_extra, "step": "llm_call"},
+        )
         if used_fallback and _needs_schema_repair(extracted_data, schema):
+            logger.info(
+                "Schema repair triggered: fallback response missing required schema fields",
+                extra={**log_extra, "step": "schema_repair"},
+            )
+            repair_started_at = time.monotonic()
             extracted_data = await _repair_json_to_schema(
                 endpoint=f"{OPENROUTER_BASE_URL.rstrip('/')}/chat/completions",
                 headers=headers,
@@ -4840,6 +5186,11 @@ async def _extract_via_openrouter(payload: ExtractionRequest) -> dict[str, Any]:
                 schema=schema,
                 candidate=extracted_data,
                 provider_name="OpenRouter schema repair",
+            )
+            logger.info(
+                "Schema repair finished in %.2fs",
+                time.monotonic() - repair_started_at,
+                extra={**log_extra, "step": "schema_repair"},
             )
         # Нормализуем references: некоторые модели возвращают dict вместо list
         _normalize_references_in_place(extracted_data)
@@ -4860,23 +5211,42 @@ async def _extract_via_openrouter(payload: ExtractionRequest) -> dict[str, Any]:
                 if office_meta is not None:
                     office_meta["pdf_preview"] = {"created": True}
             except Exception as exc:
-                logger.exception("%s PDF preview conversion failed", doc_kind)
+                logger.exception(
+                    "%s PDF preview conversion failed",
+                    doc_kind,
+                    extra={**log_extra, "step": "office_to_pdf_preview"},
+                )
                 if office_meta is not None:
                     office_meta["pdf_preview"] = {
                         "created": False,
                         "error": str(exc),
                     }
+        geometry_started_at = time.monotonic()
         geometry_metadata = await to_thread.run_sync(
             lambda: _enrich_references_with_pdf_geometry(
                 extracted_data,
                 local_path=geometry_local_path,
                 content_type=geometry_content_type,
+                log_context=log_extra,
             )
+        )
+        stage_timings["geometry_enrichment"] = time.monotonic() - geometry_started_at
+        logger.info(
+            "Geometry enrichment done in %.2fs: references=%s matched=%s applied=%s",
+            stage_timings["geometry_enrichment"],
+            geometry_metadata.get("reference_count"),
+            geometry_metadata.get("matched_reference_count"),
+            geometry_metadata.get("applied"),
+            extra={**log_extra, "step": "geometry_enrichment"},
         )
     except HTTPException:
         raise
     except Exception as exc:
-        logger.exception("OpenRouter extraction failed")
+        logger.exception(
+            "OpenRouter extraction failed after %.2fs; stage_timings=%s",
+            time.monotonic() - started_at, stage_timings,
+            extra=log_extra,
+        )
         detail = (
             f"OpenRouter extraction failed: {exc}\n\n"
             f"Extraction service traceback:\n{traceback.format_exc()}"
@@ -4889,7 +5259,11 @@ async def _extract_via_openrouter(payload: ExtractionRequest) -> dict[str, Any]:
         if docx_pdf_temp_dir is not None:
             docx_pdf_temp_dir.cleanup()
         elapsed = time.monotonic() - started_at
-        logger.info("OpenRouter extraction finished in %.2fs", elapsed)
+        logger.info(
+            "OpenRouter extraction finished in %.2fs; stage_timings=%s",
+            elapsed, stage_timings,
+            extra={**log_extra, "step": "finished"},
+        )
 
     response = {
         "analysis_id": payload.analysis_id,
@@ -5313,24 +5687,69 @@ async def ocr_index(url: str) -> dict:
 
 @app.post("/extract")
 async def extract_document(payload: ExtractionRequest) -> dict:
+    log_extra = {
+        "analysis_id": payload.analysis_id,
+        "file_id": payload.file_id,
+        "file_type": payload.file_type,
+        "step": "extract_document",
+    }
+    started_at = time.monotonic()
+
     if not payload.schema_payload and not payload.prompt:
+        logger.warning("Rejecting /extract: no schema and no prompt", extra=log_extra)
         raise HTTPException(status_code=400, detail="schema or prompt is required")
 
     parsed_url = urlparse(payload.file_url)
     if parsed_url.scheme not in {"http", "https"}:
+        logger.warning(
+            "Rejecting /extract: file_url is not http(s): %s", parsed_url.scheme,
+            extra=log_extra,
+        )
         raise HTTPException(status_code=400, detail="file_url must be a public URL")
 
     backend = _select_backend(payload.backend)
-    if backend == "docling_local":
-        return await _extract_via_docling_local(payload)
-    if backend == "docling_remote":
-        return await _extract_via_docling_remote(payload)
-    if backend == "openrouter":
-        return await _extract_via_openrouter(payload)
-    if backend == "llamaparse":
-        return await _extract_via_llamaparse(payload)
-    if backend == "mineru":
-        return await _extract_via_mineru(payload)
-    if backend == "pdfplumber":
-        return await _extract_via_pdfplumber(payload)
+    logger.info(
+        "extract_document started backend=%s file_url=%s",
+        backend, _redact_url(payload.file_url),
+        extra=log_extra,
+    )
+    try:
+        if backend == "docling_local":
+            result = await _extract_via_docling_local(payload)
+        elif backend == "docling_remote":
+            result = await _extract_via_docling_remote(payload)
+        elif backend == "openrouter":
+            result = await _extract_via_openrouter(payload)
+        elif backend == "llamaparse":
+            result = await _extract_via_llamaparse(payload)
+        elif backend == "mineru":
+            result = await _extract_via_mineru(payload)
+        elif backend == "pdfplumber":
+            result = await _extract_via_pdfplumber(payload)
+        elif backend in ("paddleocr_vl", "yandex_vision_ocr"):
+            result = await _extract_via_paddleocr_vl(payload)
+        else:
+            result = None
+    except HTTPException as exc:
+        logger.error(
+            "extract_document failed backend=%s status=%s detail=%s elapsed=%.2fs",
+            backend, exc.status_code, exc.detail, time.monotonic() - started_at,
+            extra=log_extra,
+        )
+        raise
+    except Exception:
+        logger.exception(
+            "extract_document crashed backend=%s elapsed=%.2fs",
+            backend, time.monotonic() - started_at,
+            extra=log_extra,
+        )
+        raise
+    else:
+        if result is not None:
+            logger.info(
+                "extract_document finished backend=%s elapsed=%.2fs",
+                backend, time.monotonic() - started_at,
+                extra=log_extra,
+            )
+            return result
     raise HTTPException(status_code=400, detail=f"Unsupported backend: {backend}")
