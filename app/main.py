@@ -4398,9 +4398,14 @@ def _paddleocr_vl_specs_to_products(
     specifications: list[dict[str, Any]], paddle_pages: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
     """Конвертирует yandex.specifications[] (формат paddleocr-vl-service) в
-    result.products[].characteristics[] (формат ivolga), группируя по
-    variant — один product на уникальный variant, характеристики без variant
-    попадают в отдельный product "Общее"."""
+    result.products[].characteristics[] (формат ivolga), группируя по variant.
+    Характеристики БЕЗ variant (общие, не привязанные к конкретной модели)
+    никогда не образуют отдельный продукт "Общее" — они приписываются к уже
+    известным именованным моделям: если именованная модель ровно одна, общие
+    характеристики уходят в неё; если их несколько (каталог паспорта), общая
+    характеристика дублируется в КАЖДУЮ; если именованных моделей нет вовсе,
+    общие характеристики образуют единственный безымянный продукт
+    (product_name=None)."""
     page_dims: dict[int, tuple[float, float]] = {}
     for idx, page in enumerate(paddle_pages):
         pruned = (page or {}).get("prunedResult") or {}
@@ -4408,14 +4413,24 @@ def _paddleocr_vl_specs_to_products(
         if width and height:
             page_dims[idx] = (float(width), float(height))
 
-    products_by_variant: dict[str, dict[str, Any]] = {}
-    order: list[str] = []
+    named_variants: list[str] = []
+    for spec in specifications:
+        variant = spec.get("variant")
+        if variant and variant not in named_variants:
+            named_variants.append(variant)
+
+    products_by_variant: dict[str | None, dict[str, Any]] = {}
+    order: list[str | None] = []
+
+    def _ensure_product(key: str | None) -> dict[str, Any]:
+        if key not in products_by_variant:
+            products_by_variant[key] = {"product_name": key, "characteristics": []}
+            order.append(key)
+        return products_by_variant[key]
 
     for spec in specifications:
-        variant = spec.get("variant") or "Общее"
-        if variant not in products_by_variant:
-            products_by_variant[variant] = {"product_name": variant, "characteristics": []}
-            order.append(variant)
+        variant = spec.get("variant")
+        target_keys = [variant] if variant else (named_variants or [None])
 
         value = spec.get("value") or ""
         unit = spec.get("unit")
@@ -4449,13 +4464,15 @@ def _paddleocr_vl_specs_to_products(
                 reference["bbox"] = _paddle_bbox_to_reference_bbox(block_bbox, *dims)
             references.append(reference)
 
-        products_by_variant[variant]["characteristics"].append(
-            {
-                "name": spec.get("name"),
-                "value": value_text,
-                "references": references,
-            }
-        )
+        for key in target_keys:
+            product = _ensure_product(key)
+            product["characteristics"].append(
+                {
+                    "name": spec.get("name"),
+                    "value": value_text,
+                    "references": list(references),
+                }
+            )
 
     return [products_by_variant[v] for v in order]
 
