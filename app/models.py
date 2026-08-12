@@ -31,6 +31,12 @@ class ExtractionRequest(BaseModel):
     # остаются полностью синхронными — нет длинной облачной OCR-цепочки,
     # которая оправдывала бы усложнение).
     async_mode: bool = False
+    # Модель изделия, указанная пользователем при загрузке (необязательно).
+    # Для openrouter уже используется в промпте через _build_product_model_appendix.
+    # Для yandex_vision_ocr/paddleocr_vl прокидывается в paddleocr-vl-service как
+    # fallback-источник variant, когда явного заголовка модели на странице нет и
+    # document_outline не даёт однозначного ответа — см. _extract_via_paddleocr_vl.
+    product_model: Optional[str] = None
 
 
 @dataclass

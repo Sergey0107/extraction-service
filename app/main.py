@@ -4529,6 +4529,7 @@ async def _extract_via_paddleocr_vl(payload: ExtractionRequest) -> dict[str, Any
                         "ocr_provider": ocr_provider,
                         "async_mode": True,
                         "job_id": payload.job_id,
+                        "product_model": payload.product_model,
                     },
                 )
                 response.raise_for_status()
@@ -4557,7 +4558,12 @@ async def _extract_via_paddleocr_vl(payload: ExtractionRequest) -> dict[str, Any
         async with httpx.AsyncClient(timeout=PADDLEOCR_VL_REQUEST_TIMEOUT_SECONDS) as client:
             response = await client.post(
                 f"{PADDLEOCR_VL_SERVICE_URL.rstrip('/')}/extract-specs-by-url",
-                json={"file_url": payload.file_url, "filename": filename, "ocr_provider": ocr_provider},
+                json={
+                    "file_url": payload.file_url,
+                    "filename": filename,
+                    "ocr_provider": ocr_provider,
+                    "product_model": payload.product_model,
+                },
             )
             response.raise_for_status()
             data = response.json()
