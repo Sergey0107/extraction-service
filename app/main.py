@@ -88,6 +88,7 @@ from app.pdfplumber_extractor import build_llm_payload as build_pdfplumber_llm_p
 from app.pdfplumber_extractor import extract_pdf_geometry
 from app.pdfplumber_extractor import filter_relevant_pages as filter_pdfplumber_pages
 from app.pdfplumber_extractor import plain_text_for_quality_check
+from app.url_guard import UrlNotAllowed, validate_public_url
 from app.schema_utils import normalize_json_schema
 
 
@@ -986,10 +987,16 @@ async def _download_file(file_url: str) -> DownloadedFile:
     temp_path = ""
     started_at = time.monotonic()
     redacted_url = _redact_url(file_url)
+    # SSRF: file_url приходит в теле запроса /extract. Раньше проверялась
+    # только схема, из-за чего URL мог вести на метаданные облака или на
+    # внутренние сервисы. Валидация до запроса + отключённые редиректы:
+    # с follow_redirects=True разрешённый хост мог увести на запрещённый
+    # уже после проверки.
+    validate_public_url(file_url)
     try:
         async with httpx.AsyncClient(
             timeout=FILE_DOWNLOAD_TIMEOUT_SECONDS,
-            follow_redirects=True,
+            follow_redirects=False,
             trust_env=False,
         ) as client:
             async with client.stream("GET", file_url) as response:
@@ -5648,9 +5655,14 @@ async def render_pdf(url: str) -> Response:
     if not PYMUPDF_INSTALLED:
         raise HTTPException(status_code=501, detail="PyMuPDF not available")
 
-    parsed = urlparse(url)
-    if parsed.scheme not in {"http", "https"}:
-        raise HTTPException(status_code=400, detail="url must be http or https")
+    # Проверки схемы недостаточно: хост не валидировался, и URL мог указывать
+    # на 169.254.169.254 (метаданные облака с IAM-токенами) или на внутренние
+    # сервисы compose. validate_public_url резолвит хост и отклоняет
+    # непубличные адреса, кроме явного allowlist объектного хранилища.
+    try:
+        validate_public_url(url)
+    except UrlNotAllowed as exc:
+        raise HTTPException(status_code=400, detail=f"url отклонён: {exc}")
 
     cache_key = _render_cache_key(url)
     cache_path = RENDER_CACHE_DIR / f"{cache_key}.pdf"
@@ -5751,9 +5763,11 @@ async def ocr_index(url: str) -> dict:
 
     Намеренно не переиспользует и не меняет _enrich_references_with_pdf_geometry
     и основной пайплайн /extract — это независимый read-only помощник."""
-    parsed = urlparse(url)
-    if parsed.scheme not in {"http", "https"}:
-        raise HTTPException(status_code=400, detail="url must be http or https")
+    # См. комментарий в /render-pdf: проверка одной лишь схемы оставляла SSRF.
+    try:
+        validate_public_url(url)
+    except UrlNotAllowed as exc:
+        raise HTTPException(status_code=400, detail=f"url отклонён: {exc}")
     if not PYMUPDF_INSTALLED:
         raise HTTPException(status_code=501, detail="PyMuPDF not available")
 
