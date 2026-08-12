@@ -2847,6 +2847,49 @@ def _build_openai_headers(api_key: Optional[str]) -> dict[str, str]:
     return headers
 
 
+# Число попыток и базовая задержка (экспоненциальный бэкофф) для сетевых
+# сбоев (ReadTimeout/ConnectError/ConnectTimeout) при вызове LLM-провайдера
+# извлечения (OpenRouter/AI Tunnel — backend'ы openrouter/mineru/pdfplumber/
+# llamaparse все проходят через эту функцию). Раньше единичный ReadTimeout
+# ронял весь Celery-таск extract_file, который затем ретраился ЦЕЛИКОМ
+# (заново скачивание файла и весь запрос) — тот же класс проблемы, что
+# чинили для Yandex-пути в paddleocr-vl-service/yandex_structurer.py, только
+# локальный retry здесь на порядок дешевле, чем retry всего таска.
+_CHAT_COMPLETION_MAX_ATTEMPTS = int(os.environ.get("CHAT_COMPLETION_MAX_ATTEMPTS", "3"))
+_CHAT_COMPLETION_RETRY_BASE_DELAY_SECONDS = float(
+    os.environ.get("CHAT_COMPLETION_RETRY_BASE_DELAY_SECONDS", "5")
+)
+
+
+async def _post_with_retry(
+    client: httpx.AsyncClient,
+    endpoint: str,
+    *,
+    json: dict[str, Any],
+    headers: dict[str, str],
+    provider_name: str,
+) -> httpx.Response:
+    """POST с ретраем только сетевых сбоев (таймаут/обрыв соединения) —
+    HTTP-ошибки провайдера (4xx/5xx) возвращаются как есть и обрабатываются
+    существующей логикой fallback/ошибок в _chat_completion_json."""
+    last_exc: Exception | None = None
+    for attempt in range(1, _CHAT_COMPLETION_MAX_ATTEMPTS + 1):
+        try:
+            return await client.post(endpoint, json=json, headers=headers)
+        except (httpx.TimeoutException, httpx.ConnectError) as exc:
+            last_exc = exc
+            if attempt == _CHAT_COMPLETION_MAX_ATTEMPTS:
+                break
+            delay = _CHAT_COMPLETION_RETRY_BASE_DELAY_SECONDS * (2 ** (attempt - 1))
+            logger.warning(
+                "%s request failed on attempt %d/%d (%s), retrying in %.0fs",
+                provider_name, attempt, _CHAT_COMPLETION_MAX_ATTEMPTS, exc, delay,
+            )
+            await asyncio.sleep(delay)
+    assert last_exc is not None
+    raise last_exc
+
+
 async def _chat_completion_json(
     *,
     endpoint: str,
@@ -2883,7 +2926,9 @@ async def _chat_completion_json(
         timeout=REMOTE_API_TIMEOUT_SECONDS,
         trust_env=False,
     ) as client:
-        response = await client.post(endpoint, json=actual_payload, headers=headers)
+        response = await _post_with_retry(
+            client, endpoint, json=actual_payload, headers=headers, provider_name=provider_name,
+        )
 
         if response.status_code >= 400 and "response_format" in actual_payload:
             logger.warning(
@@ -4446,6 +4491,50 @@ async def _extract_via_paddleocr_vl(payload: ExtractionRequest) -> dict[str, Any
 
     filename = _guess_filename_from_url(payload.file_url, None)
     started_at = time.monotonic()
+
+    # async_mode: только для yandex_vision_ocr — облачная OCR+LLM цепочка на
+    # больших документах (60-70+ страниц) может занимать дольше, чем разумно
+    # держать один синхронный HTTP-запрос открытым (см. обсуждение с
+    # пользователем: ReadTimeout после 30 минут ронял всю Celery-задачу и
+    # терял весь прогресс). paddleocr_vl (GPU, локальный, быстрый) остаётся
+    # синхронным — там этой проблемы нет, усложнение не оправдано.
+    if payload.async_mode and backend == "yandex_vision_ocr":
+        try:
+            # Короткий таймаут: этот запрос лишь СТАВИТ job в очередь на
+            # стороне paddleocr-vl-service и получает job_id обратно — сама
+            # обработка документа идёт в фоне там же, см. job_queue.py.
+            async with httpx.AsyncClient(timeout=30) as client:
+                response = await client.post(
+                    f"{PADDLEOCR_VL_SERVICE_URL.rstrip('/')}/extract-specs-by-url",
+                    json={
+                        "file_url": payload.file_url,
+                        "filename": filename,
+                        "ocr_provider": ocr_provider,
+                        "async_mode": True,
+                        "job_id": payload.job_id,
+                    },
+                )
+                response.raise_for_status()
+                data = response.json()
+        except httpx.HTTPStatusError as exc:
+            logger.exception("paddleocr-vl-service returned an error while starting async job")
+            raise HTTPException(
+                status_code=502,
+                detail=f"paddleocr-vl-service failed: {exc.response.status_code} {exc.response.text[:500]}",
+            ) from exc
+        except httpx.RequestError as exc:
+            logger.exception("Failed to reach paddleocr-vl-service to start async job")
+            raise HTTPException(status_code=502, detail=f"Failed to reach paddleocr-vl-service: {exc!r}") from exc
+
+        logger.info(
+            "paddleocr_vl async job started: job_id=%s elapsed=%.2fs",
+            data.get("job_id"), time.monotonic() - started_at,
+        )
+        # Маркер "работа продолжается асинхронно" — вызывающая сторона
+        # (api-gateway/tasks.py) распознаёт это по ключу "async" и не
+        # трактует как готовый результат извлечения. Финальный результат
+        # придёт позже через callback на /internal/extraction-callback.
+        return {"async": True, "job_id": data.get("job_id")}
 
     try:
         async with httpx.AsyncClient(timeout=PADDLEOCR_VL_REQUEST_TIMEOUT_SECONDS) as client:

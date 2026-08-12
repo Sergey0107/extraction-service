@@ -19,6 +19,18 @@ class ExtractionRequest(BaseModel):
         default=None,
         description="docling_local | docling_remote | openrouter | llamaparse",
     )
+    # job_id — id extraction_job на стороне api-gateway. Используется только
+    # backend'ом yandex_vision_ocr в async-режиме (см. _extract_via_paddleocr_vl):
+    # передаётся дальше в paddleocr-vl-service как job_id для идемпотентного
+    # старта job'а (тот же job_id => тот же job, не дублируется при повторной
+    # отправке), и не имеет смысла для остальных синхронных backend'ов.
+    job_id: Optional[str] = None
+    # True — извлечение асинхронное: /extract вернёт {"async": true, "job_id": ...}
+    # немедленно вместо ожидания полного результата. Поддерживается только
+    # backend=yandex_vision_ocr; для остальных backend'ов игнорируется (они
+    # остаются полностью синхронными — нет длинной облачной OCR-цепочки,
+    # которая оправдывала бы усложнение).
+    async_mode: bool = False
 
 
 @dataclass
