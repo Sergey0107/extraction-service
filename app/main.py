@@ -93,6 +93,12 @@ from app.schema_utils import normalize_json_schema
 
 
 _strict_schema_supported: dict[str, bool] = {}
+# Модели, у которых reasoning нельзя отключить: провайдер отвечает 400
+# "Reasoning is mandatory for this endpoint and cannot be disabled"
+# (замечено на AI Tunnel для gemini-3.7-flash). Заполняется на первом таком
+# отказе, дальше параметр этой модели просто не отправляется — как и с
+# _strict_schema_supported, разведка стоит один запрос за жизнь процесса.
+_reasoning_disable_supported: dict[str, bool] = {}
 
 
 @asynccontextmanager
@@ -941,6 +947,22 @@ def _extract_error_text_from_response(response: httpx.Response, provider_name: s
 
     text = json.dumps(payload, ensure_ascii=False)[:800]
     return text or f"{provider_name} returned HTTP {response.status_code}"
+
+
+def _mentions_mandatory_reasoning(response: httpx.Response) -> bool:
+    """True, если провайдер отказал именно из-за попытки отключить reasoning.
+
+    Текст ошибки на AI Tunnel: "Reasoning is mandatory for this endpoint and
+    cannot be disabled". Ищем по ключевым словам, а не по точной строке —
+    формулировка у разных провайдеров отличается."""
+    try:
+        text = response.text or ""
+    except Exception:
+        return False
+    lowered = text.lower()
+    return "reasoning" in lowered and (
+        "mandatory" in lowered or "cannot be disabled" in lowered or "can not be disabled" in lowered
+    )
 
 
 def _raise_provider_http_error(response: httpx.Response, provider_name: str) -> None:
@@ -2915,7 +2937,12 @@ async def _chat_completion_json(
     # это резко увеличивает время ответа на больших документах и может увести
     # модель от точного соблюдения структуры/схемы. Извлечению reasoning не
     # нужен, поэтому глушим его явно, если вызывающий код не задал иное.
-    if "reasoning" not in payload:
+    #
+    # Но у части моделей reasoning отключить НЕЛЬЗЯ: на gemini-3.7-flash
+    # провайдер отвечает 400 "Reasoning is mandatory for this endpoint and
+    # cannot be disabled" и извлечение падает целиком. Для таких моделей
+    # параметр не отправляем вовсе (список наполняется ниже, при первом отказе).
+    if "reasoning" not in payload and _reasoning_disable_supported.get(model_key) is not False:
         payload = dict(payload)
         payload["reasoning"] = {"enabled": False}
 
@@ -2936,6 +2963,29 @@ async def _chat_completion_json(
         response = await _post_with_retry(
             client, endpoint, json=actual_payload, headers=headers, provider_name=provider_name,
         )
+
+        # Модель требует reasoning и не даёт его отключить — повторяем запрос
+        # без этого параметра. Проверяется ДО ветки response_format: причина
+        # отказа здесь другая, и снятие схемы её бы не устранило, а только
+        # ухудшило структуру ответа.
+        if (
+            response.status_code >= 400
+            and "reasoning" in actual_payload
+            and _mentions_mandatory_reasoning(response)
+        ):
+            logger.warning(
+                "%s: model %s requires reasoning, retrying without the disable flag",
+                provider_name, model_key or "<unknown>",
+            )
+            if model_key:
+                _reasoning_disable_supported[model_key] = False
+            actual_payload = dict(actual_payload)
+            actual_payload.pop("reasoning", None)
+            payload = dict(payload)
+            payload.pop("reasoning", None)
+            response = await _post_with_retry(
+                client, endpoint, json=actual_payload, headers=headers, provider_name=provider_name,
+            )
 
         if response.status_code >= 400 and "response_format" in actual_payload:
             logger.warning(
