@@ -4401,18 +4401,116 @@ def _paddle_bbox_to_reference_bbox(
     }
 
 
+# Строки, которыми LLM обозначает "значения нет" — без отсева доезжают до
+# интерфейса в виде "None кВт". Копия из api-gateway/paddleocr_vl_convert.py.
+_EMPTY_VALUE_TOKENS = {"none", "null", "n/a", "na", "nan", "-", "—", "–", ""}
+
+
+def _clean_value(value: Any) -> str:
+    """Значение характеристики, где "пустышки" от LLM приведены к пустой строке."""
+    if value is None:
+        return ""
+    text = str(value).strip()
+    return "" if text.lower() in _EMPTY_VALUE_TOKENS else text
+
+
+def _spec_page_index(spec: dict[str, Any]) -> int | None:
+    """Номер страницы, на которой найдена характеристика (0-based, как отдаёт
+    paddleocr-vl-service). None, если источник не проставлен."""
+    source = spec.get("source") or {}
+    page_index = source.get("page_index")
+    return page_index if isinstance(page_index, int) else None
+
+
+def _build_page_variant_map(
+    specifications: list[dict[str, Any]],
+) -> dict[int, str]:
+    """Карта "страница -> изделие" по характеристикам, у которых variant задан
+    явно. Страница-якорь попадает в карту, только если ВСЕ её
+    variant-размеченные характеристики принадлежат одному изделию:
+    страница-переход, где встречаются метки сразу двух моделей, якорем не
+    становится — там безопаснее старое поведение (дублирование), чем угадывание.
+
+    От якорей принадлежность РАСПРОСТРАНЯЕТСЯ на последующие страницы до
+    следующего якоря: в каталоге изделие описано разделом на несколько
+    страниц, а явный заголовок модели (единственный источник variant для LLM)
+    стоит только на первой странице раздела.
+
+    Страницы ДО первого якоря намеренно остаются вне карты (общая шапка
+    документа, титульный лист). Пустая карта = документ не даёт сигнала о
+    разделении по страницам, поведение остаётся прежним.
+
+    Копия логики из api-gateway/app/services/paddleocr_vl_convert.py — правки
+    обязаны идти в обе копии одновременно."""
+    variants_per_page: dict[int, set[str]] = {}
+    for spec in specifications:
+        variant = spec.get("variant")
+        page_index = _spec_page_index(spec)
+        if not variant or page_index is None:
+            continue
+        variants_per_page.setdefault(page_index, set()).add(variant)
+
+    anchors = {
+        page_index: next(iter(variants))
+        for page_index, variants in variants_per_page.items()
+        if len(variants) == 1
+    }
+    if not anchors:
+        return {}
+
+    max_page = max(
+        [p for p in (_spec_page_index(s) for s in specifications) if p is not None]
+        or [max(anchors)]
+    )
+
+    page_variants: dict[int, str] = {}
+    current: str | None = None
+    for page_index in range(max_page + 1):
+        if page_index in anchors:
+            current = anchors[page_index]
+        elif page_index in variants_per_page:
+            current = None
+        if current is not None:
+            page_variants[page_index] = current
+    return page_variants
+
+
+def _pick_single_product_name(specifications: list[dict[str, Any]]) -> str | None:
+    """Имя единственного изделия документа среди размеченных LLM вариантов.
+
+    Берём вариант с наибольшим числом характеристик: настоящее изделие описано
+    десятками строк, а фантомы — единицами (на реальном ТЗ насоса НП-1 рядом
+    с ним оказались "изделия" Мр.20, Мр.25 и 'A' — маркировки металлорукавов
+    и буква с чертежа). Копия из api-gateway/paddleocr_vl_convert.py."""
+    counts: dict[str, int] = {}
+    for spec in specifications:
+        variant = spec.get("variant")
+        if isinstance(variant, str) and variant.strip():
+            counts[variant] = counts.get(variant, 0) + 1
+    if not counts:
+        return None
+    return max(counts.items(), key=lambda item: item[1])[0]
+
+
 def _paddleocr_vl_specs_to_products(
-    specifications: list[dict[str, Any]], paddle_pages: list[dict[str, Any]]
+    specifications: list[dict[str, Any]],
+    paddle_pages: list[dict[str, Any]],
+    *,
+    single_product: bool = False,
 ) -> list[dict[str, Any]]:
     """Конвертирует yandex.specifications[] (формат paddleocr-vl-service) в
     result.products[].characteristics[] (формат ivolga), группируя по variant.
     Характеристики БЕЗ variant (общие, не привязанные к конкретной модели)
     никогда не образуют отдельный продукт "Общее" — они приписываются к уже
-    известным именованным моделям: если именованная модель ровно одна, общие
-    характеристики уходят в неё; если их несколько (каталог паспорта), общая
-    характеристика дублируется в КАЖДУЮ; если именованных моделей нет вовсе,
-    общие характеристики образуют единственный безымянный продукт
-    (product_name=None)."""
+    известным именованным моделям:
+
+    1) если именованная модель ровно одна — общие характеристики уходят в неё;
+    2) если моделей несколько (каталог паспорта на 2+ изделия) — характеристика
+       уходит в изделие СВОЕЙ страницы (см. _build_page_variant_map);
+       дублирование во все модели остаётся только как fallback, когда страница
+       ничего не говорит о принадлежности;
+    3) если именованных моделей нет вовсе, общие характеристики образуют
+       единственный безымянный продукт (product_name=None)."""
     page_dims: dict[int, tuple[float, float]] = {}
     for idx, page in enumerate(paddle_pages):
         pruned = (page or {}).get("prunedResult") or {}
@@ -4420,11 +4518,20 @@ def _paddleocr_vl_specs_to_products(
         if width and height:
             page_dims[idx] = (float(width), float(height))
 
-    named_variants: list[str] = []
-    for spec in specifications:
-        variant = spec.get("variant")
-        if variant and variant not in named_variants:
-            named_variants.append(variant)
+    if single_product:
+        # Документ описывает ровно одно изделие (ТЗ): разметка вариантов от
+        # LLM здесь шум, а не структура каталога.
+        single_name = _pick_single_product_name(specifications)
+        named_variants: list[str] = [single_name] if single_name else []
+        page_variants: dict[int, str] = {}
+    else:
+        named_variants = []
+        for spec in specifications:
+            variant = spec.get("variant")
+            if variant and variant not in named_variants:
+                named_variants.append(variant)
+
+        page_variants = _build_page_variant_map(specifications)
 
     products_by_variant: dict[str | None, dict[str, Any]] = {}
     order: list[str | None] = []
@@ -4437,11 +4544,21 @@ def _paddleocr_vl_specs_to_products(
 
     for spec in specifications:
         variant = spec.get("variant")
-        target_keys = [variant] if variant else (named_variants or [None])
+        if single_product:
+            # Всё изделие целиком — одна карточка, вне зависимости от variant.
+            target_keys = named_variants or [None]
+        elif variant:
+            target_keys = [variant]
+        elif len(named_variants) > 1:
+            page_variant = page_variants.get(_spec_page_index(spec))
+            target_keys = [page_variant] if page_variant else list(named_variants)
+        else:
+            target_keys = named_variants or [None]
 
-        value = spec.get("value") or ""
+        value = _clean_value(spec.get("value"))
         unit = spec.get("unit")
-        value_text = f"{value} {unit}".strip() if unit else value
+        # Единица без значения — мусор ("None кВт").
+        value_text = f"{value} {unit}".strip() if (unit and value) else value
 
         source = spec.get("source") or {}
         page_index = source.get("page_index")
@@ -4537,6 +4654,7 @@ async def _extract_via_paddleocr_vl(payload: ExtractionRequest) -> dict[str, Any
                         "async_mode": True,
                         "job_id": payload.job_id,
                         "product_model": payload.product_model,
+                        "target_characteristic_names": payload.target_characteristic_names,
                     },
                 )
                 response.raise_for_status()
@@ -4570,6 +4688,7 @@ async def _extract_via_paddleocr_vl(payload: ExtractionRequest) -> dict[str, Any
                     "filename": filename,
                     "ocr_provider": ocr_provider,
                     "product_model": payload.product_model,
+                    "target_characteristic_names": payload.target_characteristic_names,
                 },
             )
             response.raise_for_status()
@@ -4588,7 +4707,10 @@ async def _extract_via_paddleocr_vl(payload: ExtractionRequest) -> dict[str, Any
     yandex_result = data.get("yandex") or {}
     specifications = yandex_result.get("specifications") or []
 
-    products = _paddleocr_vl_specs_to_products(specifications, paddle_pages)
+    # ТЗ — заказ на ОДНО изделие: все его характеристики относятся к нему.
+    products = _paddleocr_vl_specs_to_products(
+        specifications, paddle_pages, single_product=(payload.file_type == "tz")
+    )
     elapsed = time.monotonic() - started_at
     logger.info(
         "paddleocr_vl extraction finished in %.2fs, %d specifications -> %d products",
@@ -4604,6 +4726,13 @@ async def _extract_via_paddleocr_vl(payload: ExtractionRequest) -> dict[str, Any
         "model_extract": "yandex-deepseek-v4-flash",
         "result": {"products": products},
         "extraction": {"pages": [_build_result_page({"products": products})]},
+        # Сырой ответ paddleocr-vl-service ДО конвертации в products — Paddle
+        # layout-parsing (bbox/текст по блокам) + LLM-structuring specifications
+        # (имя/значение/variant до группировки по изделиям). Нужен отдельно от
+        # "result", чтобы можно было скачать и посмотреть, что именно вернул
+        # OCR+LLM этап, не путая с уже причёсанным результатом конвертации
+        # (см. postprocess_extraction_result, которая кладёт это в debug-дамп).
+        "raw_ocr": data,
         "extraction_metadata": {
             "docling_version": None,
             "page_count": len(paddle_pages),

@@ -37,6 +37,14 @@ class ExtractionRequest(BaseModel):
     # fallback-источник variant, когда явного заголовка модели на странице нет и
     # document_outline не даёт однозначного ответа — см. _extract_via_paddleocr_vl.
     product_model: Optional[str] = None
+    # Имена характеристик, одобренных пользователем в ТЗ (только для паспорта).
+    # openrouter получает их внутри prompt; yandex_vision_ocr/paddleocr_vl промпт
+    # не читают, поэтому список идёт отдельным полем и передаётся дальше в
+    # paddleocr-vl-service как контракт «верни ровно эти имена дословно».
+    # Без него паспорт извлекается «вслепую», модель придумывает свои
+    # формулировки, и сопоставление с ТЗ становится вероятностным (замер на
+    # ДЖАМБО 60/35: 7 из 15 требований ТЗ не доходили до таблицы сравнения).
+    target_characteristic_names: Optional[list[str]] = None
 
 
 @dataclass
